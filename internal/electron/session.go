@@ -185,6 +185,12 @@ func (s *Session) Browser(ctx context.Context) (*engine.Browser, error) {
 	if s.browser != nil && s.browser.Alive(2*time.Second) {
 		return s.browser, nil
 	}
+	// A dead connection to an endpoint that still answers (Electron relaunched on the same port, a dropped websocket) was kept:
+	// every tool then failed with « use of closed network connection » while status said running (2026-10-22). Drop it so
+	// the tick reconnects.
+	if s.browser != nil {
+		s.detachLocked()
+	}
 	s.tickLocked(ctx)
 	if s.browser != nil {
 		return s.browser, nil

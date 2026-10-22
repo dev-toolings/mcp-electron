@@ -116,6 +116,30 @@ func boundedClick(page *rod.Page, el *rod.Element, button proto.InputMouseButton
 	return fmt.Errorf("not clickable after %s: %w", budget, err)
 }
 
+// coveredBySelf: CDP's hit test (DOM.getNodeForLocation) returns a ::before/::after node, which rod does not count as part of
+// its host, so a button drawn with a pseudo-element over itself read « covered by <CSSPseudoElement> » and was never clicked
+// (Escape's sidebar « Projets », 2026-10-22). document.elementFromPoint answers with the host: if that is the element or inside
+// it, the point is the element's own.
+func coveredBySelf(el *rod.Element, err error) (*proto.Point, bool) {
+	var covered *rod.CoveredError
+	if !errors.As(err, &covered) {
+		return nil, false
+	}
+	shape, shapeErr := el.Shape()
+	if shapeErr != nil {
+		return nil, false
+	}
+	pt := shape.OnePointInside()
+	if pt == nil {
+		return nil, false
+	}
+	hit, evalErr := el.Eval(`(x, y) => { const at = document.elementFromPoint(x, y); return !!at && (at === this || this.contains(at)); }`, pt.X, pt.Y)
+	if evalErr != nil || !hit.Value.Bool() {
+		return nil, false
+	}
+	return pt, true
+}
+
 func clickWithin(ctx context.Context, page *rod.Page, el *rod.Element, button proto.InputMouseButton, count int) error {
 	target := el.Page()
 	if target == nil {
@@ -129,6 +153,10 @@ func clickWithin(ctx context.Context, page *rod.Page, el *rod.Element, button pr
 	for {
 		pt, err := el.Interactable()
 		if err == nil {
+			point = pt
+			break
+		}
+		if pt, ok := coveredBySelf(el, err); ok {
 			point = pt
 			break
 		}
