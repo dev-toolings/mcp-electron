@@ -90,7 +90,25 @@ func clickActionableElement(page *rod.Page, el *rod.Element, button proto.InputM
 		_, err := el.Eval(`() => this.click()`)
 		return err
 	}
-	return el.Click(button, 1)
+	return boundedClick(page, el, button, 1)
+}
+
+// boundedClick is rod's Click within the action budget. Rod waits for the element to stop being
+// covered with no limit of its own: a click on a covered row once held the session's action lock
+// for 87 s (trace, 2026-10-22), blocking every later tool. Past the budget the error names what
+// covers the element, so the caller can hover first, close an overlay or scroll.
+func boundedClick(page *rod.Page, el *rod.Element, button proto.InputMouseButton, count int) error {
+	budget := actionBudget(page)
+	ctx, cancel := context.WithTimeout(el.GetContext(), budget)
+	defer cancel()
+	err := el.Context(ctx).Click(button, count)
+	if err == nil || ctx.Err() == nil {
+		return err
+	}
+	if _, why := el.Interactable(); why != nil {
+		return fmt.Errorf("not clickable after %s: %w", budget, why)
+	}
+	return fmt.Errorf("not clickable after %s: %w", budget, err)
 }
 
 // DblClickRef double-clicks the element at the given ref.
@@ -120,7 +138,7 @@ func dblClickElementWithButton(page *rod.Page, el *rod.Element, button proto.Inp
 		settleAfterAction(page, 0)
 		return nil
 	}
-	if err := el.Click(button, 2); err != nil {
+	if err := boundedClick(page, el, button, 2); err != nil {
 		return fmt.Errorf("dblclick: %w", err)
 	}
 	settleAfterAction(page, 0)
@@ -322,7 +340,7 @@ func TypeElement(page *rod.Page, el *rod.Element, text string) error {
 	if err := el.Focus(); err != nil {
 		return fmt.Errorf("focus: %w", err)
 	}
-	_ = el.Click(proto.InputMouseButtonLeft, 3)
+	_ = boundedClick(page, el, proto.InputMouseButtonLeft, 3)
 	_ = el.SelectAllText()
 	if err := page.InsertText(text); err != nil {
 		return fmt.Errorf("type text: %w", err)
