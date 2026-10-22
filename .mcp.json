@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "mcp-electron": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/mcp-electron"
+    }
+  }
+}
