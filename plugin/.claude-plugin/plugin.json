@@ -1,0 +1,17 @@
+{
+  "name": "mcp-electron",
+  "version": "0.1.0",
+  "description": "MCP server and skill to drive, inspect and debug Electron applications from Claude Code: launch in isolation or attach, accessibility snapshots with refs, actions, logs, screenshots, renderer and main-process JavaScript, Maestro-style flows.",
+  "author": {
+    "name": "dev-toolings"
+  },
+  "homepage": "https://github.com/dev-toolings/mcp-electron",
+  "repository": "https://github.com/dev-toolings/mcp-electron",
+  "keywords": [
+    "electron",
+    "mcp",
+    "testing",
+    "debugging",
+    "automation"
+  ]
+}

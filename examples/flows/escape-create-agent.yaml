@@ -1,0 +1,36 @@
+# Escape: finish the first-run setup without importing projects, create an
+# agent from scratch and check it appears in the team. Run against an
+# isolated Escape (never your real profile):
+#   mcp-electron run-flow examples/flows/escape-create-agent.yaml \
+#     --target ~/Documents/lab/sandbox/escape --env ESCAPE_TEST_DATA=$(mktemp -d /tmp/esc-XXXX)
+# Sends no message to any model.
+name: Escape — créer un agent
+env:
+  AGENT: Verificateur   # letters only: Escape rejects accents, digits and spaces
+---
+# First-run setup (skipped when the profile is already configured).
+- tapOn: { text: "Continuer", optional: true }
+- tapOn: { text: "Continuer", optional: true }
+- tapOn: { text: "Ne pas importer de projets", optional: true }
+- assertVisible:
+    role: textbox
+    text: "Message à l’agent"
+# The team lives under the Agents tab.
+- tapOn: { role: tab, text: "Agents" }
+- tapOn: { role: button, text: "Équipe" }
+- assertVisible: "Créez votre premier agent"
+- tapOn: { role: button, text: "Partir de zéro" }
+- assertVisible: "Créer un agent"
+- tapOn: { role: textbox, text: "Nom de l’agent" }
+- inputText: ${AGENT}
+- tapOn: { role: textbox, text: "Rôle" }
+- inputText: "Qualification locale"
+- tapOn: { role: textbox, text: "Instructions" }
+- inputText: "Respecte le dossier choisi. Ne contacte aucun service externe."
+- takeScreenshot: formulaire
+- tapOn: { role: button, text: "Créer l’agent" }
+- extendedWaitUntil: { notVisible: "Créer un agent", timeout: 10000 }
+- assertVisible: ${AGENT}
+- assertNotVisible: "Erreur"
+- assertMain: "BrowserWindow.getAllWindows().length >= 1"
+- takeScreenshot: equipe

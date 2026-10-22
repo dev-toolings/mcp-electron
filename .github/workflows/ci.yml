@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch or PR makes the running check pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # One Linux job: the binaries are pure Go, so every target cross-compiles
+    # here, and the short suite needs neither a display nor Electron.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod # caches modules and GOCACHE (build + test results) keyed on go.sum
+      - uses: oven-sh/setup-bun@v2
+      - name: Versions
+        run: bun scripts/release.ts check
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -short ./...
+      - name: Cross-compile darwin and windows
+        run: bun scripts/release.ts build 0.0.0-ci
+      - name: Launcher syntax
+        run: node --check npm/mcp-electron/bin/mcp-electron.js

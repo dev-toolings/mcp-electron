@@ -1,0 +1,42 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Never cancel a release half way through publishing.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # GitHub release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: oven-sh/setup-bun@v2
+      - name: Versions match the tag
+        run: bun scripts/release.ts check "$TAG"
+      - name: Vet and test
+        run: go vet ./... && go test -short ./...
+      - name: Build
+        run: bun scripts/release.ts build "$TAG"
+      - name: Stage
+        run: bun scripts/release.ts stage "$TAG"
+      - name: Publish to npm
+        run: bun scripts/release.ts publish "$TAG"
+        env:
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: GitHub release
+        run: bun scripts/release.ts github "$TAG"
+        env:
+          GH_TOKEN: ${{ github.token }}

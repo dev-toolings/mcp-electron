@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "dev-toolings",
+  "description": "Developer tooling plugins by dev-toolings.",
+  "owner": {
+    "name": "dev-toolings"
+  },
+  "plugins": [
+    {
+      "name": "mcp-electron",
+      "description": "Drive, inspect and debug Electron applications: launch a project or a .app in isolation, accessibility snapshots with refs, clicks and typing, console and main-process logs, screenshots, JavaScript in the renderer and the main process, Maestro-style flows.",
+      "category": "development",
+      "source": "./plugin"
+    }
+  ]
+}
