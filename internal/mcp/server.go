@@ -35,8 +35,9 @@ type Options struct {
 
 // Server holds the application sessions and the tool handlers.
 type Server struct {
-	opts Options
-	mgr  *electron.Manager
+	opts  Options
+	mgr   *electron.Manager
+	trace *Tracer
 }
 
 // New creates a server; Build registers the tools on an MCP server.
@@ -48,7 +49,7 @@ func New(opts Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{opts: opts, mgr: mgr}, nil
+	return &Server{opts: opts, mgr: mgr, trace: NewTracer(tracePath())}, nil
 }
 
 // Manager exposes the session manager (CLI flows reuse it).
@@ -59,7 +60,8 @@ const Instructions = `mcp-electron drives one Electron application for developme
 Loop: launch (project dir, .app, or a dev command) or attach → snapshot (refs @N) → click/type/press/… by ref, CSS selector or getByRole/getByText/getByLabel → wait_for → logs on errors → screenshot when layout matters → stop.
 Actions return a diff of the interactive elements; re-snapshot after a navigation or a big UI change (refs are per window).
 eval runs JavaScript in a window (renderer); eval_main runs in the main process (app, BrowserWindow, ipcMain, dialog… are in scope).
-A dev command (bun run dev) that restarts Electron on recompilation is followed automatically: tools answer "restarting" until the new instance is reachable.`
+A dev command (bun run dev) that restarts Electron on recompilation is followed automatically: tools answer "restarting" until the new instance is reachable.
+When a call fails, hangs, times out or is interrupted, read trace (problems: true; with_stacks: true for a call reported stuck): every call's arguments, duration and outcome, host cancellations, and the server's goroutines when a call ran past 20 s. Use it to find the cause and fix mcp-electron itself.`
 
 // toolDef is one entry of the tool table.
 type toolDef struct {
@@ -76,9 +78,9 @@ func (s *Server) Build() *mcpsrv.MCPServer {
 	)
 	for _, def := range s.tools() {
 		h := def.handler
-		srv.AddTool(def.tool, func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		srv.AddTool(def.tool, s.trace.Wrap(def.tool.Name, func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 			return h(s, ctx, req)
-		})
+		}))
 	}
 	return srv
 }
@@ -99,12 +101,14 @@ func (s *Server) tools() []toolDef {
 	defs = append(defs, s.sessionTools()...)
 	defs = append(defs, s.pageTools()...)
 	defs = append(defs, s.flowTools()...)
+	defs = append(defs, s.traceTools()...)
 	return defs
 }
 
 // Close stops every application the server launched.
 func (s *Server) Close() {
 	s.mgr.Close()
+	s.trace.Close()
 }
 
 func logf(format string, args ...any) {
