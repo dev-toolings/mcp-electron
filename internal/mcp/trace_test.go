@@ -75,4 +75,10 @@ func TestTraceRecordsCallsCancellationsAndStuckCalls(t *testing.T) {
 	if s, _ := problems[4]["goroutines"].(string); s != "<omitted: with_stacks true>" {
 		t.Fatalf("stacks not omitted: %.40q", s)
 	}
+	if err := tr.Clear(); err != nil {
+		t.Fatal(err)
+	}
+	if left, _ := tr.Read(traceQuery{last: 100}); len(left) != 0 {
+		t.Fatalf("cleared trace still has %d lines", len(left))
+	}
 }

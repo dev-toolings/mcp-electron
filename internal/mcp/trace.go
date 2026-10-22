@@ -24,10 +24,13 @@ import (
 // of the server's goroutines when it is still running after StuckAfter.
 
 const (
-	traceEnv        = "MCP_ELECTRON_TRACE"
-	traceMaxBytes   = 16 << 20
+	traceEnv = "MCP_ELECTRON_TRACE"
+	// Kevin: nothing may grow for nothing. One rotation of 2 MiB (4 MiB at most), files older than a day
+	// are removed when the server starts, and the trace tool clears them once a problem is fixed.
+	traceMaxBytes   = 2 << 20
+	traceMaxAge     = 24 * time.Hour
 	traceStuckAfter = 20 * time.Second
-	traceTail       = 4 << 20
+	traceTail       = 2 << 20
 	traceResult     = 600
 	traceStack      = 64 << 10
 )
@@ -65,6 +68,11 @@ func NewTracer(path string) *Tracer {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		logf("trace disabled: %v", err)
 		return nil
+	}
+	for _, p := range []string{path, path + ".1"} {
+		if info, err := os.Stat(p); err == nil && time.Since(info.ModTime()) > traceMaxAge {
+			_ = os.Remove(p)
+		}
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -114,6 +122,26 @@ func (t *Tracer) write(rec map[string]any) {
 	}
 	n, _ := t.file.Write(line)
 	t.size += int64(n)
+}
+
+// Clear removes the trace and its rotated copy, then starts an empty one.
+func (t *Tracer) Clear() error {
+	if t == nil {
+		return fmt.Errorf("trace disabled (%s=off or no cache directory)", traceEnv)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.file != nil {
+		t.file.Close()
+	}
+	_ = os.Remove(t.path + ".1")
+	f, err := os.OpenFile(t.path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.file = nil
+		return err
+	}
+	t.file, t.size = f, 0
+	return nil
 }
 
 // Close flushes nothing (writes are unbuffered) and closes the file.

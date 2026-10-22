@@ -19,12 +19,19 @@ func (s *Server) traceTools() []toolDef {
 			mcpgo.WithBoolean("problems", mcpgo.Description("Only failed, cancelled and stuck calls (with their start line)."), mcpgo.DefaultBool(false)),
 			mcpgo.WithNumber("since_seconds", mcpgo.Description("Only lines newer than this many seconds.")),
 			mcpgo.WithBoolean("with_stacks", mcpgo.Description("Include the goroutine dumps of stuck calls (long)."), mcpgo.DefaultBool(false)),
-			mcpgo.WithTitleAnnotation("Read the server trace"), mcpgo.WithReadOnlyHintAnnotation(true), mcpgo.WithOpenWorldHintAnnotation(false),
+			mcpgo.WithBoolean("clear", mcpgo.Description("Delete the trace once the problem is understood or fixed (it is also bounded to 4 MiB and removed after a day)."), mcpgo.DefaultBool(false)),
+			mcpgo.WithTitleAnnotation("Read the server trace"), mcpgo.WithOpenWorldHintAnnotation(false),
 		), (*Server).handleTrace},
 	}
 }
 
 func (s *Server) handleTrace(_ context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	if mcpgo.ParseBoolean(req, "clear", false) {
+		if err := s.trace.Clear(); err != nil {
+			return errResult(err)
+		}
+		return mcpgo.NewToolResultText("trace cleared: " + s.trace.Path()), nil
+	}
 	q := traceQuery{
 		last:       min(max(mcpgo.ParseInt(req, "last", 40), 1), 500),
 		tool:       strings.TrimSpace(mcpgo.ParseString(req, "tool", "")),
