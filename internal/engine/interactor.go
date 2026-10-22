@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ysmood/gson"
+
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/proto"
@@ -95,13 +97,16 @@ func clickActionableElement(page *rod.Page, el *rod.Element, button proto.InputM
 
 // boundedClick is rod's Click within the action budget. Rod waits for the element to stop being
 // covered with no limit of its own: a click on a covered row once held the session's action lock
-// for 87 s (trace, 2026-10-22), blocking every later tool. Past the budget the error names what
-// covers the element, so the caller can hover first, close an overlay or scroll.
+// for 87 s (trace, 2026-10-22), blocking every later tool. And rod's ScrollIntoView waits for a
+// repaint (requestAnimationFrame) on the page's own context, which the element's deadline does not
+// reach: in a hidden or occluded window no frame comes, and a click announced « 8s » took 199 s
+// (trace, 2026-10-22). So every step here is a CDP call on the bounded context: scroll, the
+// interactable point, then real mouse events. Past the budget the error names what covers the element.
 func boundedClick(page *rod.Page, el *rod.Element, button proto.InputMouseButton, count int) error {
 	budget := actionBudget(page)
 	ctx, cancel := context.WithTimeout(el.GetContext(), budget)
 	defer cancel()
-	err := el.Context(ctx).Click(button, count)
+	err := clickWithin(ctx, page, el.Context(ctx), button, count)
 	if err == nil || ctx.Err() == nil {
 		return err
 	}
@@ -109,6 +114,46 @@ func boundedClick(page *rod.Page, el *rod.Element, button proto.InputMouseButton
 		return fmt.Errorf("not clickable after %s: %w", budget, why)
 	}
 	return fmt.Errorf("not clickable after %s: %w", budget, err)
+}
+
+func clickWithin(ctx context.Context, page *rod.Page, el *rod.Element, button proto.InputMouseButton, count int) error {
+	target := el.Page()
+	if target == nil {
+		target = page
+	}
+	target = target.Context(ctx)
+	if _, err := el.Eval(`() => this.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'})`); err != nil {
+		return err
+	}
+	var point *proto.Point
+	for {
+		pt, err := el.Interactable()
+		if err == nil {
+			point = pt
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if err := (proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMouseMoved, X: point.X, Y: point.Y}).Call(target); err != nil {
+		return err
+	}
+	buttons := map[proto.InputMouseButton]int{proto.InputMouseButtonLeft: 1, proto.InputMouseButtonRight: 2, proto.InputMouseButtonMiddle: 4}[button]
+	for n := 1; n <= count; n++ {
+		if err := (proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMousePressed, X: point.X, Y: point.Y, Button: button, Buttons: gson.Int(buttons), ClickCount: n}).Call(target); err != nil {
+			return err
+		}
+		if err := (proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMouseReleased, X: point.X, Y: point.Y, Button: button, Buttons: gson.Int(0), ClickCount: n}).Call(target); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // DblClickRef double-clicks the element at the given ref.
