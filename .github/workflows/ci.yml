@@ -35,5 +35,7 @@ jobs:
         run: go test -short ./...
       - name: Cross-compile darwin and windows
         run: bun scripts/release.ts build 0.0.0-ci
+      - name: Assemble plugin (universal macOS binary)
+        run: bun scripts/release.ts plugin "$(jq -r .version plugin/.claude-plugin/plugin.json)"
       - name: Launcher syntax
         run: node --check npm/mcp-electron/bin/mcp-electron.js

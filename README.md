@@ -24,7 +24,8 @@ for the main process.
 
 ## Install
 
-As a Claude Code plugin (MCP server + skill, updated with the plugin):
+As a Claude Code plugin (MCP server + skill, with the binary for macOS
+universal and Windows x64 bundled: nothing else to install):
 
 ```
 /plugin install mcp-electron --marketplace dev-toolings/mcp-electron
@@ -33,12 +34,10 @@ As a Claude Code plugin (MCP server + skill, updated with the plugin):
 On older Claude Code versions: `/plugin marketplace add dev-toolings/mcp-electron`,
 then `/plugin install mcp-electron@dev-toolings`.
 
-As a bare MCP server, like `@playwright/mcp` (any MCP host; prebuilt for macOS
-arm64/x64 and Windows arm64/x64):
-
-```bash
-claude mcp add --scope user mcp-electron -- npx -y @dev-toolings/mcp-electron@latest
-```
+For other MCP hosts, download the archive of your platform from the
+[GitHub releases](https://github.com/dev-toolings/mcp-electron/releases)
+(checksums in `SHA256SUMS`) and register `mcp-electron mcp` over stdio, or
+build from source:
 
 From source, with the CLI installer (also registers Codex and writes the skill
 to `~/.claude/skills` and `~/.codex/skills`; do not combine it with the
@@ -184,30 +183,33 @@ Layout: `internal/engine` (renderer engine from ghostchrome, attach-only
 `internal/mcp` (tools), `internal/flow` (YAML flows), `cmd/mcp-electron`
 (CLI), `plugin/` (Claude Code plugin: manifest, `.mcp.json`, and the skill,
 also embedded in the binary by `plugin/skills`), `.claude-plugin/` (the
-marketplace), `npm/mcp-electron` (npm launcher), `scripts/release.ts`.
+marketplace), `npm/mcp-electron` (npm launcher, unpublished), `scripts/release.ts`.
 
 ## Release
 
-The npm package `@dev-toolings/mcp-electron` is a small Node launcher whose
-`optionalDependencies` are one package per platform
-(`@dev-toolings/mcp-electron-{darwin,win32}-{arm64,x64}`), each holding the
-stripped Go binary; the package manager installs only the matching one. The
-plugin's `.mcp.json` pins the same version, so the skill and the server always
-ship together.
+The marketplace (`.claude-plugin/marketplace.json` on `main`) serves the
+plugin from the `dist` branch, which the release workflow replaces on every
+tag with a single commit: `plugin/` (manifest, `.mcp.json`, skill) plus
+`bin/mcp-electron` (universal macOS binary, assembled by the script since
+Linux has no `lipo`) and `bin/mcp-electron.exe` (Windows x64, which Windows on
+arm64 runs too). `.mcp.json` starts `${CLAUDE_PLUGIN_ROOT}/bin/mcp-electron`
+directly: no Node, no npx, no registry, and no secret beyond the workflow's
+own `GITHUB_TOKEN`.
 
 ```bash
-bun scripts/release.ts version 0.2.0   # plugin.json, .mcp.json, npm package.json
+bun scripts/release.ts version 0.2.0   # plugin.json (+ the dormant npm package.json)
 git commit -am "release 0.2.0" && git tag v0.2.0
-git push origin v0.2.0                 # release workflow: test, build, publish npm, GitHub release
-git push origin main                   # only once the release is green: the marketplace serves main
+git push origin main v0.2.0            # release workflow: test, build, GitHub release, dist branch
 ```
 
-Pushing `main` last matters: plugin users get the new `.mcp.json` from the
-default branch, and it must not point at a version that npm does not have
-yet. The workflow needs an `NPM_TOKEN` secret (granular token with publish
-rights on `@dev-toolings`). It is idempotent: re-running a failed release
-skips the packages already published (platform packages always go first) and
-updates an existing GitHub release.
+The `dist` branch is generated: never commit to it. It moves only once the
+build and the GitHub release succeeded, and re-running a release replaces it
+again. To try a plugin build locally: `bun scripts/release.ts build 0.2.0 &&
+bun scripts/release.ts plugin 0.2.0`, then `claude --plugin-dir dist/plugin`.
+
+An npm distribution (`npm/mcp-electron`: Node launcher plus one package per
+platform) is ready but not published; `bun scripts/release.ts stage` and
+`publish` (with `NPM_CONFIG_TOKEN`) would ship it.
 
 CI runs on a single `ubuntu-latest` job (no macOS or Windows runners): the
 binaries are pure Go and cross-compile in parallel in a few seconds,

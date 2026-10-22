@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write # GitHub release
+  contents: write # GitHub release and the dist branch
 
 jobs:
   release:
@@ -32,11 +32,13 @@ jobs:
         run: bun scripts/release.ts build "$TAG"
       - name: Stage
         run: bun scripts/release.ts stage "$TAG"
-      - name: Publish to npm
-        run: bun scripts/release.ts publish "$TAG"
-        env:
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Assemble plugin
+        run: bun scripts/release.ts plugin "$TAG"
       - name: GitHub release
         run: bun scripts/release.ts github "$TAG"
         env:
           GH_TOKEN: ${{ github.token }}
+      # Last: the marketplace serves the dist branch, so plugin users only
+      # see this version once everything above succeeded.
+      - name: Publish plugin to the dist branch
+        run: bun scripts/release.ts push-plugin "$TAG"

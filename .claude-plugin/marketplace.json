@@ -10,7 +10,11 @@
       "name": "mcp-electron",
       "description": "Drive, inspect and debug Electron applications: launch a project or a .app in isolation, accessibility snapshots with refs, clicks and typing, console and main-process logs, screenshots, JavaScript in the renderer and the main process, Maestro-style flows.",
       "category": "development",
-      "source": "./plugin"
+      "source": {
+        "source": "github",
+        "repo": "dev-toolings/mcp-electron",
+        "ref": "dist"
+      }
     }
   ]
 }

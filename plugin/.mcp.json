@@ -1,11 +1,7 @@
 {
   "mcpServers": {
     "mcp-electron": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@dev-toolings/mcp-electron@0.1.0"
-      ]
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/mcp-electron"
     }
   }
 }

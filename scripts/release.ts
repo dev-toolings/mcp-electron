@@ -1,11 +1,14 @@
-// Release tooling for the npm distribution and the Claude Code plugin.
+// Release tooling for the Claude Code plugin, the GitHub release and the
+// (optional) npm distribution.
 //
-//   bun scripts/release.ts version X.Y.Z   set the version everywhere it is pinned
-//   bun scripts/release.ts check [vX.Y.Z]  verify pinned versions agree (and match the tag)
-//   bun scripts/release.ts build [X.Y.Z]   cross-compile every target in parallel into dist/bin
-//   bun scripts/release.ts stage X.Y.Z     write the npm packages and release archives into dist/
-//   bun scripts/release.ts publish X.Y.Z   publish the npm packages, skipping versions already published
-//   bun scripts/release.ts github X.Y.Z    create or update the GitHub release with the archives
+//   bun scripts/release.ts version X.Y.Z      set the version everywhere it is pinned
+//   bun scripts/release.ts check [vX.Y.Z]     verify pinned versions agree (and match the tag)
+//   bun scripts/release.ts build [X.Y.Z]      cross-compile every target in parallel into dist/bin
+//   bun scripts/release.ts stage X.Y.Z        write the npm packages and release archives into dist/
+//   bun scripts/release.ts plugin X.Y.Z       assemble the installable plugin with its binaries in dist/plugin
+//   bun scripts/release.ts push-plugin X.Y.Z  replace the `dist` branch (what the marketplace serves) with dist/plugin
+//   bun scripts/release.ts github X.Y.Z       create or update the GitHub release with the archives
+//   bun scripts/release.ts publish X.Y.Z      publish the npm packages (not run by the release workflow)
 //
 // The binaries are pure Go (CGO_ENABLED=0), so one Linux runner builds every
 // target; the Go linker ad-hoc signs darwin/arm64 binaries itself.
@@ -16,8 +19,13 @@ const ROOT = join(import.meta.dir, "..");
 const DIST = join(ROOT, "dist");
 const SCOPE = "@dev-toolings";
 const MAIN = `${SCOPE}/mcp-electron`;
-const PLUGIN_JSON = join(ROOT, "plugin/.claude-plugin/plugin.json");
-const MCP_JSON = join(ROOT, "plugin/.mcp.json");
+const PLUGIN_DIR = join(ROOT, "plugin");
+const PLUGIN_JSON = join(PLUGIN_DIR, ".claude-plugin/plugin.json");
+const MCP_JSON = join(PLUGIN_DIR, ".mcp.json");
+// One command for every OS: macOS runs the universal binary bin/mcp-electron,
+// Windows resolves the extension-less name to bin/mcp-electron.exe.
+const PLUGIN_COMMAND = "${CLAUDE_PLUGIN_ROOT}/bin/mcp-electron";
+const DIST_BRANCH = "dist";
 const NPM_MAIN = join(ROOT, "npm/mcp-electron");
 const SEMVER = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
 
@@ -64,17 +72,10 @@ async function run(cmd: string[], opts: { cwd?: string; env?: Record<string, str
   if (code !== 0) die(`${cmd.join(" ")} exited with ${code}`);
 }
 
-const mcpSpec = (v: string) => `${MAIN}@${v}`;
-
 async function setVersion(v: string) {
   const plugin = await readJSON(PLUGIN_JSON);
   plugin.version = v;
   await writeJSON(PLUGIN_JSON, plugin);
-
-  const mcp = await readJSON(MCP_JSON);
-  const server = mcp.mcpServers["mcp-electron"];
-  server.args = server.args.map((a: string) => (a.startsWith(`${MAIN}@`) ? mcpSpec(v) : a));
-  await writeJSON(MCP_JSON, mcp);
 
   const pkgPath = join(NPM_MAIN, "package.json");
   const pkg = await readJSON(pkgPath);
@@ -90,8 +91,8 @@ async function check(tag: string | undefined) {
   const v = (await readJSON(PLUGIN_JSON)).version as string;
   if (!SEMVER.test(v)) errors.push(`plugin.json version ${JSON.stringify(v)} is not semver`);
 
-  const args: string[] = (await readJSON(MCP_JSON)).mcpServers?.["mcp-electron"]?.args ?? [];
-  if (!args.includes(mcpSpec(v))) errors.push(`plugin/.mcp.json must run ${mcpSpec(v)} (args: ${JSON.stringify(args)})`);
+  const command = (await readJSON(MCP_JSON)).mcpServers?.["mcp-electron"]?.command;
+  if (command !== PLUGIN_COMMAND) errors.push(`plugin/.mcp.json must run ${PLUGIN_COMMAND} (command: ${JSON.stringify(command)})`);
 
   const pkg = await readJSON(join(NPM_MAIN, "package.json"));
   if (pkg.name !== MAIN) errors.push(`npm package name is ${pkg.name}, expected ${MAIN}`);
@@ -175,6 +176,93 @@ async function stage(v: string) {
   console.log(`staged npm packages in ${npmDir} and archives in ${relDir}`);
 }
 
+// universal joins thin 64-bit Mach-O binaries into one fat (universal)
+// binary, as `lipo -create` does, which Linux runners do not have. Each slice
+// keeps its own code signature.
+function universal(slices: Uint8Array[]): Uint8Array {
+  const ALIGN = 14; // 16 KiB, what lipo uses for arm64 slices
+  const step = 1 << ALIGN;
+  const up = (n: number) => Math.ceil(n / step) * step;
+  let offset = up(8 + 20 * slices.length);
+  const entries = slices.map((s) => {
+    const dv = new DataView(s.buffer, s.byteOffset, s.byteLength);
+    if (dv.getUint32(0, true) !== 0xfeedfacf) die("universal: slice is not a thin 64-bit Mach-O");
+    const entry = { cputype: dv.getUint32(4, true), cpusubtype: dv.getUint32(8, true), offset, size: s.byteLength };
+    offset = up(offset + s.byteLength);
+    return entry;
+  });
+  const last = entries[entries.length - 1];
+  const out = new Uint8Array(last.offset + last.size);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, 0xcafebabe); // FAT_MAGIC, big-endian like the whole fat header
+  dv.setUint32(4, entries.length);
+  entries.forEach((e, i) => {
+    const at = 8 + 20 * i;
+    dv.setUint32(at, e.cputype);
+    dv.setUint32(at + 4, e.cpusubtype);
+    dv.setUint32(at + 8, e.offset);
+    dv.setUint32(at + 12, e.size);
+    dv.setUint32(at + 16, ALIGN);
+    out.set(slices[i], e.offset);
+  });
+  return out;
+}
+
+async function binary(key: Target["key"], v: string): Promise<Uint8Array> {
+  const t = TARGETS.find((t) => t.key === key)!;
+  const path = join(DIST, "bin", t.key, exe(t));
+  if (!(await Bun.file(path).exists())) die(`${path} missing; run build ${v} first`);
+  return new Uint8Array(await Bun.file(path).arrayBuffer());
+}
+
+// plugin writes the installable plugin: manifest, .mcp.json, skill and two
+// binaries (universal macOS, Windows x64; Windows on arm64 runs x64 binaries).
+async function plugin(v: string) {
+  await check(v);
+  const out = join(DIST, "plugin");
+  await rm(out, { recursive: true, force: true });
+  await mkdir(join(out, "bin"), { recursive: true });
+  await cp(join(PLUGIN_DIR, ".claude-plugin"), join(out, ".claude-plugin"), { recursive: true });
+  await cp(MCP_JSON, join(out, ".mcp.json"));
+  await cp(join(PLUGIN_DIR, "skills/mcp-electron"), join(out, "skills/mcp-electron"), { recursive: true });
+
+  const mac = join(out, "bin", "mcp-electron");
+  await Bun.write(mac, universal([await binary("darwin-x64", v), await binary("darwin-arm64", v)]));
+  await chmod(mac, 0o755);
+  await Bun.write(join(out, "bin", "mcp-electron.exe"), await binary("win32-x64", v));
+  console.log(`assembled plugin ${v} in ${out}`);
+}
+
+function git(args: string[], env: Record<string, string> = {}): string {
+  const r = Bun.spawnSync(["git", ...args], { cwd: ROOT, env: { ...process.env, ...env }, stderr: "pipe" });
+  if (r.exitCode !== 0) die(`git ${args.join(" ")}: ${r.stderr.toString().trim()}`);
+  return r.stdout.toString().trim();
+}
+
+// pushPlugin replaces the dist branch with a single commit holding
+// dist/plugin. It goes through a throwaway index so the checkout, its branch
+// and its credentials are used as they are; replacing the branch keeps
+// binaries of past releases out of every clone.
+async function pushPlugin(v: string) {
+  const dir = join(DIST, "plugin");
+  if ((await readJSON(join(dir, ".claude-plugin/plugin.json"))).version !== v) die(`dist/plugin is not ${v}; run plugin ${v} first`);
+  const index = join(DIST, "plugin.index");
+  await rm(index, { force: true });
+  const env = { GIT_INDEX_FILE: index };
+  git(["-C", dir, "--work-tree", ".", "add", "--all", "--force", "."], env);
+  const tree = git(["write-tree"], env);
+  const source = git(["rev-parse", "HEAD"]);
+  const commit = git(["commit-tree", tree, "-m", `mcp-electron ${v}\n\nBuilt from ${source}.`], {
+    GIT_AUTHOR_NAME: "github-actions[bot]",
+    GIT_AUTHOR_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com",
+    GIT_COMMITTER_NAME: "github-actions[bot]",
+    GIT_COMMITTER_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com",
+  });
+  await rm(index, { force: true });
+  git(["push", "--force", "origin", `${commit}:refs/heads/${DIST_BRANCH}`]);
+  console.log(`pushed ${commit} to ${DIST_BRANCH}`);
+}
+
 async function published(name: string, v: string): Promise<boolean> {
   const res = await fetch(`https://registry.npmjs.org/${name.replace("/", "%2f")}/${v}`);
   if (res.status === 200) return true;
@@ -223,6 +311,12 @@ switch (cmd) {
     break;
   case "stage":
     await stage(parseVersion(arg));
+    break;
+  case "plugin":
+    await plugin(parseVersion(arg));
+    break;
+  case "push-plugin":
+    await pushPlugin(parseVersion(arg));
     break;
   case "publish":
     await publish(parseVersion(arg));
