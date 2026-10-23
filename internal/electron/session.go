@@ -445,8 +445,9 @@ type Manager struct {
 	// MaxSessions caps the open sessions (launched or attached); 0 means
 	// DefaultMaxSessions. Every session is a whole Electron process tree.
 	MaxSessions int
-	// IdleTimeout stops a launched application nobody has used for that
-	// long (tools, flows). 0 means DefaultIdleTimeout; negative disables.
+	// IdleTimeout stops a target launch nobody has used for that long
+	// (tools, flows); dev command sessions are exempt. 0 means
+	// DefaultIdleTimeout; negative disables.
 	IdleTimeout time.Duration
 
 	mu       sync.Mutex
@@ -555,7 +556,10 @@ func (m *Manager) add(s *Session) (*Session, error) {
 	s.lastUse = s.Started
 	s.state = StateRunning
 	s.stopWatch = make(chan struct{})
-	if s.Owned {
+	// A dev command is the developer's working app, kept open between
+	// tool calls on purpose: only isolated target launches, the copies an
+	// agent may forget, are stopped when idle.
+	if s.Owned && s.Mode != "command" {
 		if idle := m.idleTimeout(); idle > 0 {
 			s.idleAfter = idle
 			id := s.ID

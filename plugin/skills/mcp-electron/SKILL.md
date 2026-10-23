@@ -76,7 +76,7 @@ the last error.
 - Only loopback endpoints are accepted.
 - Resources: at most 3 sessions at once (each is a whole Electron process
   tree); `launch`/`attach` refuse beyond that and name what to stop. A
-  launched app unused for 30 minutes is stopped. `status` shows each
+  `target` launch unused for 30 minutes is stopped (a dev `command` session is not). `status` shows each
   session's process count, resident memory and CPU; stop what you no longer
   need instead of launching another copy. Full-page screenshots above 32 Mpx
   are refused.

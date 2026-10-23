@@ -73,9 +73,10 @@ helpers), so the server keeps them bounded:
 
 - **Session cap**: 3 open sessions by default (`--max-sessions`); `launch`
   and `attach` refuse beyond it and name the sessions to stop.
-- **Idle stop**: a launched app with no tool or flow access for 30 minutes
+- **Idle stop**: a `target` launch with no tool or flow access for 30 minutes
   (`--idle-timeout`, `0` disables) is stopped and the reason is logged.
-  Attached apps are never stopped.
+  A dev `command` session (the developer's working app) and attached apps
+  are never stopped for idleness.
 - **Teardown**: `stop`, the idle timer, and the server's own exit (stdin
   closed, SIGTERM) terminate the full process tree top-down (SIGTERM, then
   SIGKILL after 10 s), including helpers that re-parented themselves, and

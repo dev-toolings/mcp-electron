@@ -181,6 +181,26 @@ func TestIdleTimeoutStopsOwnedSession(t *testing.T) {
 	}
 }
 
+func TestIdleTimeoutSparesDevCommandSession(t *testing.T) {
+	m, err := NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.IdleTimeout = 200 * time.Millisecond
+	s := &Session{Info: Info{Name: "dev", Mode: "command", Owned: true}, ring: NewRing(10)}
+	if _, err := m.add(s); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.Stop(s.ID) })
+	if st := s.Status(); st.IdleStopIn != 0 {
+		t.Fatalf("dev command session announced an idle stop: %+v", st)
+	}
+	time.Sleep(time.Second)
+	if len(m.List()) != 1 {
+		t.Fatal("dev command session was stopped for idleness")
+	}
+}
+
 func TestStopDeletesArtifactsUnlessKept(t *testing.T) {
 	m, err := NewManager(t.TempDir())
 	if err != nil {
