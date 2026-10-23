@@ -112,6 +112,11 @@ type Session struct {
 	hubbed     map[string]bool
 	stopWatch  chan struct{}
 	actions    sync.Mutex
+	// A dev command keeps a state file (devPath) so the next server can
+	// adopt it; its output is followed from log files (tails).
+	dev     *devState
+	devPath string
+	tails   []*fileTail
 }
 
 // Actions serialises UI actions on this session (page tools take it; status
@@ -708,19 +713,62 @@ func (m *Manager) launchCommand(ctx context.Context, spec LaunchSpec) (*Session,
 	if err != nil {
 		return nil, &UsageError{fmt.Sprintf("command %q not found: %v", argv[0], err)}
 	}
+	key := devKey(spec.Dir, spec.Command, spec.Inspect)
+	statePath := m.devStatePath(key)
+	if prev, err := readDevState(statePath); err == nil {
+		if prev.stillOurs() {
+			return m.adoptCommand(ctx, prev, statePath, timeout)
+		}
+		removeDevState(statePath, prev)
+	}
 	s := &Session{Info: Info{Name: firstNonEmpty(spec.Name, filepath.Base(argv[0])+" "+strings.Join(argv[1:], " ")), Mode: "command", Owned: true, Endpoint: loopbackEndpoint(cdpPort)}, ring: NewRing(5000)}
 	if spec.Inspect {
 		s.Inspector = loopbackEndpoint(inspPort)
 	}
-	s.Note = fmt.Sprintf("dev command: the script must start electron with --remote-debugging-port=$%s%s; the session re-attaches automatically after every restart", EnvCDPPort, map[bool]string{true: " and --inspect=127.0.0.1:$" + EnvInspectPort, false: ""}[spec.Inspect])
-	p, err := startOwned(exe, argv[1:], mergeEnv(extra, cdpPort, inspPort), spec.Dir, s.ring, "")
+	s.Note = fmt.Sprintf("dev command: the script must start electron with --remote-debugging-port=$%s%s; the session re-attaches automatically after every restart; it keeps running when this server exits, and the next launch of the same command adopts it (stop ends it)", EnvCDPPort, map[bool]string{true: " and --inspect=127.0.0.1:$" + EnvInspectPort, false: ""}[spec.Inspect])
+	// Files, not pipes: the app must survive this server, and a closed pipe
+	// would kill it on its next write.
+	stdout, stderr, err := openDevLogs(m.devDir(), key)
+	if err != nil {
+		return nil, fmt.Errorf("dev command logs: %w", err)
+	}
+	p, err := startOwnedTo(exe, argv[1:], mergeEnv(extra, cdpPort, inspPort), spec.Dir, stdout, stderr, s.ring, "")
+	stdout.Close()
+	stderr.Close()
 	if err != nil {
 		return nil, err
 	}
 	s.proc, s.PID = p, p.pid
+	s.tails = []*fileTail{tailFile(stdout.Name(), 0, s.ring.Writer("stdout")), tailFile(stderr.Name(), 0, s.ring.Writer("stderr"))}
+	s.dev = &devState{Name: s.Name, Dir: spec.Dir, Command: spec.Command, Inspect: spec.Inspect, PID: p.pid, PGID: p.pid, RootCmd: rootCommand(p.pid), CDPPort: cdpPort, InspPort: inspPort, Started: time.Now(), StdoutLog: stdout.Name(), StderrLog: stderr.Name()}
+	s.devPath = statePath
+	if s.dev.RootCmd != "" {
+		if err := writeDevState(statePath, s.dev); err != nil {
+			s.ring.Add("mcp-electron", "dev state not written, the app will not be adopted by a later server: "+err.Error())
+		}
+	}
 	if err := s.waitReady(ctx, timeout); err != nil {
 		s.stop(false)
 		return nil, err
+	}
+	return m.add(s)
+}
+
+// adoptCommand takes over a dev command an earlier server started and left
+// running, instead of starting a second copy.
+func (m *Manager) adoptCommand(ctx context.Context, prev *devState, statePath string, timeout time.Duration) (*Session, error) {
+	s := &Session{Info: Info{Name: prev.Name, Mode: "command", Owned: true, Endpoint: loopbackEndpoint(prev.CDPPort), PID: prev.PID}, ring: NewRing(5000), dev: prev, devPath: statePath}
+	if prev.InspPort > 0 {
+		s.Inspector = loopbackEndpoint(prev.InspPort)
+	}
+	s.Note = fmt.Sprintf("adopted the dev command started %s by an earlier server (pid %d): same app, same ports; it keeps running when this server exits (stop ends it)", prev.Started.Format("15:04:05"), prev.PID)
+	s.proc = adoptOwned(prev.PID, prev.RootCmd, s.ring)
+	// The last lines give the context; what follows streams as before.
+	s.tails = []*fileTail{tailFile(prev.StdoutLog, -16*1024, s.ring.Writer("stdout")), tailFile(prev.StderrLog, -16*1024, s.ring.Writer("stderr"))}
+	if err := s.waitReady(ctx, timeout); err != nil {
+		// The developer's app is not ours to kill because it is slow: leave it.
+		s.release()
+		return nil, fmt.Errorf("found the dev command left running (pid %d) but could not reach it: %w; stop it yourself or remove %s", prev.PID, err, statePath)
 	}
 	return m.add(s)
 }
@@ -922,11 +970,42 @@ func (m *Manager) stopSession(id string, keepArtifacts bool) (*StopReport, error
 	return s.stop(keepArtifacts), nil
 }
 
-// Close stops every session (server shutdown).
+// Close ends every session (server shutdown). A dev command still running
+// is released, not stopped: it is the developer's app and the next server
+// adopts it.
 func (m *Manager) Close() {
 	for _, s := range m.List() {
+		if s.devPath != "" && s.proc != nil && !s.proc.exited() {
+			m.mu.Lock()
+			delete(m.sessions, s.ID)
+			m.mu.Unlock()
+			s.release()
+			continue
+		}
 		_, _ = m.Stop(s.ID)
 	}
+}
+
+// release lets go of a session without signalling its application.
+func (s *Session) release() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return
+	}
+	s.stopped = true
+	s.setStateLocked(StateStopped)
+	if s.stopWatch != nil {
+		close(s.stopWatch)
+	}
+	s.detachLocked()
+	for _, t := range s.tails {
+		t.close()
+	}
+	if s.proc != nil {
+		s.proc.release()
+	}
+	s.releaseArtifactsLocked(&StopReport{}, false)
 }
 
 func (s *Session) stop(keepArtifacts bool) *StopReport {
@@ -951,7 +1030,13 @@ func (s *Session) stop(keepArtifacts bool) *StopReport {
 	if s.proc != nil {
 		rep.Survivors = s.proc.terminate()
 	}
+	for _, t := range s.tails {
+		t.close()
+	}
 	rep.Terminated = len(rep.Survivors) == 0
+	if s.devPath != "" && rep.Terminated {
+		removeDevState(s.devPath, s.dev)
+	}
 	if s.root != "" {
 		var rmErr error
 		for i := 0; i < 5; i++ {

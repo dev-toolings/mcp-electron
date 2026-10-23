@@ -81,6 +81,13 @@ helpers), so the server keeps them bounded:
   closed, SIGTERM) terminate the full process tree top-down (SIGTERM, then
   SIGKILL after 10 s), including helpers that re-parented themselves, and
   delete the private profile.
+- **Dev commands outlive the server**: a `command` session writes its output
+  to files and a state file under `<cache>/mcp-electron/dev/`. When the
+  server exits it releases the app instead of stopping it, and the next
+  `launch` of the same command in the same directory adopts it (same
+  process, same ports) instead of starting a second copy. Only `stop` ends
+  it. A recycled pid is never adopted (pid, process group and command line
+  must all match). Not on Windows.
 - **Measurement**: `status` reports each session's live process count,
   resident memory and CPU share (one `ps` scan, at most once per second) and
   warns above 2 GB.

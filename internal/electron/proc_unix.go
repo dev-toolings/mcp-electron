@@ -28,3 +28,6 @@ func signalPID(pid int, kill bool) {
 	}
 	_ = syscall.Kill(pid, sig)
 }
+
+// processGroupOf returns the process group of pid.
+func processGroupOf(pid int) (int, error) { return syscall.Getpgid(pid) }

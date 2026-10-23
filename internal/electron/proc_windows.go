@@ -3,6 +3,7 @@
 package electron
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"strconv"
@@ -27,3 +28,6 @@ func signalPID(pid int, kill bool) {
 		_ = p.Kill()
 	}
 }
+
+// processGroupOf is unsupported: a dev command is never adopted on Windows.
+func processGroupOf(pid int) (int, error) { return 0, errors.New("no process groups on Windows") }

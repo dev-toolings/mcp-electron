@@ -70,6 +70,9 @@ the last error.
   removes it on `stop`. Apps that relocate their own data read their own
   variable: pass it through `env` (Escape: `ESCAPE_TEST_DATA`).
 - Never attach to or drive the developer's real profile unless asked.
+- A dev `command` session survives this server: when the server exits the
+  app keeps running, and the next `launch` of the same command adopts it
+  (no second copy). Only `stop` ends it.
 - `stop` terminates the whole process tree of a launched app, including
   detached helpers, top-down (SIGTERM, then SIGKILL after 10 s), and reports
   survivors. Attached apps are left running.

@@ -2,6 +2,7 @@ package electron
 
 import (
 	"fmt"
+	"io"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -14,12 +15,16 @@ import (
 // sometimes detached services that outlive the group; they are found through
 // the descendant record and the launch marker (the private profile path).
 type ownedProc struct {
-	pid    int
-	cmd    *exec.Cmd
-	ring   *Ring
-	marker string
-	done   chan struct{}
-	err    error
+	pid int
+	cmd *exec.Cmd
+	// adopted is a dev command started by an earlier server: no exec.Cmd,
+	// its exit is noticed by polling rootCmd.
+	adopted bool
+	rootCmd string
+	ring    *Ring
+	marker  string
+	done    chan struct{}
+	err     error
 
 	mu   sync.Mutex
 	seen map[int]string // pid → command line at first sighting
@@ -30,9 +35,14 @@ type ownedProc struct {
 // startOwned starts exe in its own process group, with stdout and stderr
 // flowing into ring.
 func startOwned(exe string, args, env []string, dir string, ring *Ring, marker string) (*ownedProc, error) {
+	return startOwnedTo(exe, args, env, dir, ring.Writer("stdout"), ring.Writer("stderr"), ring, marker)
+}
+
+// startOwnedTo is startOwned with the outputs given (files for a dev command).
+func startOwnedTo(exe string, args, env []string, dir string, stdout, stderr io.Writer, ring *Ring, marker string) (*ownedProc, error) {
 	cmd := exec.Command(exe, args...)
 	cmd.Env, cmd.Dir = env, dir
-	cmd.Stdout, cmd.Stderr = ring.Writer("stdout"), ring.Writer("stderr")
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	setProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start %s: %w", exe, err)
@@ -42,6 +52,29 @@ func startOwned(exe string, args, env []string, dir string, ring *Ring, marker s
 	go p.watch()
 	return p, nil
 }
+
+// adoptOwned follows a process group an earlier server started.
+func adoptOwned(pid int, rootCmd string, ring *Ring) *ownedProc {
+	p := &ownedProc{pid: pid, adopted: true, rootCmd: rootCmd, ring: ring, done: make(chan struct{}), seen: map[int]string{}, stop: make(chan struct{})}
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for rootCommand(pid) == rootCmd {
+			select {
+			case <-p.stop:
+				return
+			case <-t.C:
+			}
+		}
+		p.err = fmt.Errorf("process %d exited", pid)
+		close(p.done)
+	}()
+	go p.watch()
+	return p
+}
+
+// release stops following the process without signalling it.
+func (p *ownedProc) release() { p.once.Do(func() { close(p.stop) }) }
 
 func (p *ownedProc) exited() bool {
 	select {
@@ -242,8 +275,9 @@ var terminateGrace = 10 * time.Second
 // confirm its shutdown, and is SIGKILLed holding its locks.
 func (p *ownedProc) terminate() []int {
 	p.refresh()
-	p.once.Do(func() { close(p.stop) })
-	if p.cmd != nil {
+	alivePoll := p.adopted && !p.exited()
+	p.release()
+	if p.cmd != nil || alivePoll {
 		signalGroup(p.pid, false)
 	}
 	p.mu.Lock()
@@ -260,7 +294,7 @@ func (p *ownedProc) terminate() []int {
 				out[e.pid] = e.ppid
 			}
 		}
-		if p.cmd != nil && !p.exited() {
+		if p.cmd != nil && !p.exited() || p.adopted && rootCommand(p.pid) == p.rootCmd {
 			out[p.pid] = 0
 		}
 		return out
@@ -285,7 +319,7 @@ func (p *ownedProc) terminate() []int {
 	for pid := range alive() {
 		signalPID(pid, true)
 	}
-	if p.cmd != nil {
+	if p.cmd != nil || alivePoll {
 		signalGroup(p.pid, true)
 	}
 	time.Sleep(300 * time.Millisecond)
