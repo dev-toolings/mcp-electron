@@ -30,8 +30,10 @@ func (s *Server) sessionTools() []toolDef {
 			mcpgo.WithTitleAnnotation("Launch application"), mcpgo.WithDestructiveHintAnnotation(true), mcpgo.WithOpenWorldHintAnnotation(false),
 		), (*Server).handleLaunch},
 		{mcpgo.NewTool("attach",
-			mcpgo.WithDescription("Attach to an Electron app already running with --remote-debugging-port (endpoint http://127.0.0.1:PORT or just the port). Optional inspector_endpoint: its main process --inspect endpoint, for eval_main. stop detaches without closing the app."),
-			mcpgo.WithString("endpoint", mcpgo.Required(), mcpgo.Description("Remote debugging endpoint, e.g. http://127.0.0.1:9222 or 9222.")),
+			mcpgo.WithDescription("Attach to an Electron app already running, without restarting it: endpoint for one started with --remote-debugging-port (http://127.0.0.1:PORT or just the port), or pid for any running app's main process (macOS, Linux): its own port when it has one, else its Node inspector (opened with SIGUSR1 if needed, refused by a packaged app whose inspect fuse is off) starts a CDP bridge inside the app, and the inspector is closed again unless inspector: true. Optional inspector_endpoint: its main process --inspect endpoint, for eval_main. stop detaches without closing the app."),
+			mcpgo.WithString("endpoint", mcpgo.Description("Remote debugging endpoint, e.g. http://127.0.0.1:9222 or 9222. Give this or pid.")),
+			mcpgo.WithNumber("pid", mcpgo.Description("Main process id of a running Electron app (not a --type= helper). Give this or endpoint.")),
+			mcpgo.WithBoolean("inspector", mcpgo.Description("With pid: keep open the Node inspector this attach opened, for eval_main (any local process can reach the main process there until the app quits). Default false."), mcpgo.DefaultBool(false)),
 			mcpgo.WithString("inspector_endpoint", mcpgo.Description("Main process Node inspector endpoint, e.g. http://127.0.0.1:9229.")),
 			mcpgo.WithString("name", mcpgo.Description("Display name for the session.")),
 			mcpgo.WithTitleAnnotation("Attach to a running application"), mcpgo.WithOpenWorldHintAnnotation(false),
@@ -139,9 +141,11 @@ func (s *Server) handleLaunch(ctx context.Context, req mcpgo.CallToolRequest) (*
 
 func (s *Server) handleAttach(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	sess, err := s.mgr.Attach(ctx, electron.AttachSpec{
-		Endpoint:  mcpgo.ParseString(req, "endpoint", ""),
-		Inspector: mcpgo.ParseString(req, "inspector_endpoint", ""),
-		Name:      mcpgo.ParseString(req, "name", ""),
+		Endpoint:      mcpgo.ParseString(req, "endpoint", ""),
+		Inspector:     mcpgo.ParseString(req, "inspector_endpoint", ""),
+		Name:          mcpgo.ParseString(req, "name", ""),
+		PID:           int(mcpgo.ParseFloat64(req, "pid", 0)),
+		KeepInspector: mcpgo.ParseBoolean(req, "inspector", false),
 	})
 	if err != nil {
 		return errResult(err)

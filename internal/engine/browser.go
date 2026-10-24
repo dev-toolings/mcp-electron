@@ -60,9 +60,14 @@ func Connect(ctx context.Context, endpoint string, timeout time.Duration) (*Brow
 	if err := requireLoopback(endpoint); err != nil {
 		return nil, err
 	}
-	wsURL, err := launcher.ResolveURL(endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("connect %s: %w", endpoint, err)
+	// rod's ResolveURL always asks http://host/json/version: a ws:// URL is used as given (the pid-attach
+	// bridge serves nothing at the root, so its secret path is never published).
+	wsURL := endpoint
+	if !strings.HasPrefix(endpoint, "ws://") {
+		var err error
+		if wsURL, err = launcher.ResolveURL(endpoint); err != nil {
+			return nil, fmt.Errorf("connect %s: %w", endpoint, err)
+		}
 	}
 	if timeout <= 0 {
 		timeout = 30 * time.Second

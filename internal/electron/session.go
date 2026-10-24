@@ -61,6 +61,10 @@ type AttachSpec struct {
 	// Inspector is the main process inspector endpoint, when known.
 	Inspector string
 	Name      string
+	// PID attaches to a running main process instead of an endpoint (see attachPID).
+	PID int
+	// KeepInspector leaves open the Node inspector a PID attach opened, for eval_main.
+	KeepInspector bool
 }
 
 // Info is the identity of a session: what the agent reads back.
@@ -862,8 +866,14 @@ func (s *Session) waitFirstPaint(b *engine.Browser, d time.Duration) {
 
 // Attach connects to a running application without owning it.
 func (m *Manager) Attach(ctx context.Context, spec AttachSpec) (*Session, error) {
+	if spec.Endpoint == "" && spec.PID > 0 {
+		return m.attachPID(ctx, spec)
+	}
 	if spec.Endpoint == "" {
-		return nil, &UsageError{"give endpoint (http://127.0.0.1:PORT of an Electron app started with --remote-debugging-port)"}
+		return nil, &UsageError{"give endpoint (http://127.0.0.1:PORT of an Electron app started with --remote-debugging-port) or pid (the main process of any running Electron app)"}
+	}
+	if spec.PID > 0 {
+		return nil, &UsageError{"give endpoint or pid, not both"}
 	}
 	if err := m.admit(); err != nil {
 		return nil, err

@@ -57,6 +57,10 @@ type versionInfo struct {
 // /json/version, with Browser "node.js/…": it is not a CDP browser endpoint.
 func probeCDP(ctx context.Context, endpoint string) (versionInfo, bool) {
 	var v versionInfo
+	// A ws:// endpoint (the pid-attach bridge) answers /json/version under its own secret path.
+	if rest, ok := strings.CutPrefix(endpoint, "ws://"); ok {
+		endpoint = "http://" + rest
+	}
 	if err := readJSON(ctx, strings.TrimRight(endpoint, "/")+"/json/version", &v); err != nil {
 		return v, false
 	}
