@@ -136,7 +136,7 @@ func humanMove(page *rod.Page, toX, toY float64) error {
 
 // humanHover scrolls then performs a Bézier mouse move to the element center.
 func humanHover(page *rod.Page, el *rod.Element) error {
-	if err := el.ScrollIntoView(); err != nil {
+	if err := ScrollIntoViewNow(el); err != nil {
 		return fmt.Errorf("scroll: %w", err)
 	}
 	cx, cy, err := elementCenter(el)
@@ -149,7 +149,7 @@ func humanHover(page *rod.Page, el *rod.Element) error {
 // humanClick moves to a small random offset around the element center, holds
 // briefly, then dispatches mousePressed / mouseReleased.
 func humanClick(page *rod.Page, el *rod.Element, button proto.InputMouseButton) error {
-	if err := el.ScrollIntoView(); err != nil {
+	if err := ScrollIntoViewNow(el); err != nil {
 		return fmt.Errorf("scroll: %w", err)
 	}
 	cx, cy, err := elementCenter(el)

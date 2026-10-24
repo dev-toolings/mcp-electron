@@ -83,3 +83,23 @@ func TestTailFileFollowsAppendsFromTheEnd(t *testing.T) {
 		t.Fatalf("tail from the end: %q", got)
 	}
 }
+
+func TestTailFileStartsAtALineStart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.log")
+	if err := os.WriteFile(path, []byte("first line\nsecond\nthird\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for offset, want := range map[int64]string{-6: "third", -9: "third", -13: "second"} {
+		ring := NewRing(10)
+		tail := tailFile(path, offset, ring.Writer("stdout"))
+		deadline := time.Now().Add(3 * time.Second)
+		for !strings.Contains(ring.Tail(5), want) && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		tail.close()
+		got := ring.Tail(5)
+		if !strings.Contains(got, want) || strings.Contains(got, "line") || (want == "third" && strings.Contains(got, "ond")) {
+			t.Errorf("offset %d: %q, want whole lines from %q", offset, got, want)
+		}
+	}
+}

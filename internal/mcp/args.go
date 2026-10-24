@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -26,9 +27,26 @@ type pageFn func(sess *electron.Session, b *engine.Browser, page *rod.Page) (*mc
 // session, and runs fn. Errors become tool errors, never protocol errors, so
 // the agent reads them.
 func (s *Server) withPage(ctx context.Context, req mcpgo.CallToolRequest, fn pageFn) (*mcpgo.CallToolResult, error) {
+	return s.withPageWithin(ctx, req, pageCallCeiling, fn)
+}
+
+// pageCallCeiling bounds one page tool call, whatever its own timeouts: the
+// longest a tool may be asked to wait is 2 minutes (timeout_ms), and the
+// session's action lock must never be held for longer than that by a call
+// whose CDP request the page never answers (a screenshot held it 19 minutes,
+// trace 2026-10-24). Flows, which chain many steps, are not bounded by it.
+const pageCallCeiling = 3 * time.Minute
+
+// withPageWithin is withPage bounded by limit (0: only by ctx).
+func (s *Server) withPageWithin(ctx context.Context, req mcpgo.CallToolRequest, limit time.Duration, fn pageFn) (*mcpgo.CallToolResult, error) {
 	sess, err := s.session(req)
 	if err != nil {
 		return errResult(err)
+	}
+	if limit > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, limit)
+		defer cancel()
 	}
 	window := mcpgo.ParseInt(req, "window", 0)
 	sess.Actions().Lock()
@@ -37,7 +55,11 @@ func (s *Server) withPage(ctx context.Context, req mcpgo.CallToolRequest, fn pag
 	if err != nil {
 		return errResult(err)
 	}
-	return fn(sess, b, page)
+	res, err := fn(sess, b, page)
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) && limit > 0 && res != nil && res.IsError {
+		res.Content = append(res.Content, mcpgo.NewTextContent(fmt.Sprintf("\n(the call reached the %s ceiling of a page tool: the window stopped answering; check status and logs)", limit)))
+	}
+	return res, err
 }
 
 // normalizeTarget accepts "@3", "3", "e3", "ref:3" (refs), a CSS selector,
@@ -65,6 +87,12 @@ func normalizeTarget(in string) string {
 		return fmt.Sprintf("getByLabel(%q)", strings.Trim(v, `"'`))
 	}
 	if v, ok := strings.CutPrefix(t, "role="); ok {
+		// Playwright's own form, role=textbox[name="Message"], read as
+		// role=textbox name="Message" (it used to become a role named
+		// « textbox[name=… » that never matched).
+		if m := roleBracketName.FindStringSubmatch(v); m != nil {
+			v = m[1] + " name=" + m[2]
+		}
 		role, name, hasName := strings.Cut(v, " name=")
 		role = strings.TrimSpace(role)
 		if !hasName {
@@ -78,6 +106,9 @@ func normalizeTarget(in string) string {
 	}
 	return t
 }
+
+// roleBracketName matches ROLE[name=VALUE] (VALUE quoted or a regex).
+var roleBracketName = regexp.MustCompile(`^\s*([A-Za-z]+)\s*\[\s*name\s*=\s*(.+?)\s*\]\s*$`)
 
 // regexLiteral recognises a JavaScript regex literal (/source/flags) given
 // as the name of the role=… shorthand.
@@ -97,9 +128,22 @@ func isDigits(s string) bool {
 
 func isRef(target string) bool { return strings.HasPrefix(target, "@") }
 
+// timeoutMS reads timeout_ms, or « timeout » (milliseconds too) when only
+// that was given: a wait_for with timeout "30000" silently used the 10 s
+// default and failed early (trace, 2026-10-24).
+func timeoutMS(req mcpgo.CallToolRequest, def int) int {
+	args := req.GetArguments()
+	if _, ok := args["timeout_ms"]; !ok {
+		if _, ok := args["timeout"]; ok {
+			return mcpgo.ParseInt(req, "timeout", def)
+		}
+	}
+	return mcpgo.ParseInt(req, "timeout_ms", def)
+}
+
 // lookupTimeout bounds how long an action waits for its target to appear.
 func lookupTimeout(req mcpgo.CallToolRequest) time.Duration {
-	ms := mcpgo.ParseInt(req, "timeout_ms", 10000)
+	ms := timeoutMS(req, 10000)
 	if ms <= 0 {
 		ms = 10000
 	}
@@ -111,7 +155,7 @@ func lookupTimeout(req mcpgo.CallToolRequest) time.Duration {
 
 // evalTimeout bounds eval and eval_main: 8 s by default, 2 minutes at most.
 func evalTimeout(req mcpgo.CallToolRequest) time.Duration {
-	ms := mcpgo.ParseInt(req, "timeout_ms", 8000)
+	ms := timeoutMS(req, 8000)
 	if ms <= 0 {
 		ms = 8000
 	}

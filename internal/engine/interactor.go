@@ -146,28 +146,9 @@ func clickWithin(ctx context.Context, page *rod.Page, el *rod.Element, button pr
 		target = page
 	}
 	target = target.Context(ctx)
-	if _, err := el.Eval(`() => this.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'})`); err != nil {
+	point, err := pointWithin(ctx, el)
+	if err != nil {
 		return err
-	}
-	var point *proto.Point
-	for {
-		pt, err := el.Interactable()
-		if err == nil {
-			point = pt
-			break
-		}
-		if pt, ok := coveredBySelf(el, err); ok {
-			point = pt
-			break
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
 	}
 	if err := (proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMouseMoved, X: point.X, Y: point.Y}).Call(target); err != nil {
 		return err
@@ -182,6 +163,46 @@ func clickWithin(ctx context.Context, page *rod.Page, el *rod.Element, button pr
 		}
 	}
 	return nil
+}
+
+// pointWithin scrolls el into view and waits, within ctx, for a point where
+// it receives the mouse.
+func pointWithin(ctx context.Context, el *rod.Element) (*proto.Point, error) {
+	if err := ScrollIntoViewNow(el); err != nil {
+		return nil, err
+	}
+	for {
+		pt, err := el.Interactable()
+		if err == nil {
+			return pt, nil
+		}
+		if pt, ok := coveredBySelf(el, err); ok {
+			return pt, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// hoverWithin moves the real mouse over el, every CDP call within ctx.
+func hoverWithin(ctx context.Context, page *rod.Page, el *rod.Element) error {
+	target := el.Page()
+	if target == nil {
+		target = page
+	}
+	point, err := pointWithin(ctx, el)
+	if err != nil {
+		return err
+	}
+	return proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMouseMoved, X: point.X, Y: point.Y}.Call(target.Context(ctx))
+}
+
+// DblClickElementWithButton double-clicks an already-resolved element.
+func DblClickElementWithButton(page *rod.Page, el *rod.Element, button proto.InputMouseButton) error {
+	return dblClickElementWithButton(page, el, button)
 }
 
 // DblClickRef double-clicks the element at the given ref.
@@ -259,7 +280,7 @@ func ScrollToRef(page *rod.Page, ref string, snapshot *PageSnapshot) error {
 	if err != nil {
 		return err
 	}
-	if err := el.ScrollIntoView(); err != nil {
+	if err := ScrollIntoViewNow(el); err != nil {
 		return fmt.Errorf("scroll into view: %w", err)
 	}
 	settleAfterAction(page, 0)
@@ -399,10 +420,10 @@ func TypeElement(page *rod.Page, el *rod.Element, text string) error {
 		if err := humanClick(page, el, proto.InputMouseButtonLeft); err != nil {
 			return fmt.Errorf("focus-click: %w", err)
 		}
-		if err := el.Focus(); err != nil {
+		if err := FocusElement(el); err != nil {
 			return fmt.Errorf("focus: %w", err)
 		}
-		_ = el.SelectAllText()
+		_ = selectAllNow(el)
 		sleepRand(60, 140)
 		if err := humanType(page, text); err != nil {
 			return err
@@ -416,11 +437,16 @@ func TypeElement(page *rod.Page, el *rod.Element, text string) error {
 	ctx, cancel := context.WithTimeout(el.GetContext(), budget)
 	defer cancel()
 	bel, bpage := el.Context(ctx), page.Context(ctx)
-	if err := bel.Focus(); err != nil {
+	if err := FocusElement(bel); err != nil {
 		return fmt.Errorf("focus: %w", withinBudget(ctx, budget, err))
 	}
-	_ = boundedClick(page, el, proto.InputMouseButtonLeft, 3)
-	_ = bel.SelectAllText()
+	// Chromium does not answer mouse events in a hidden window (no frame to
+	// deliver them in): the click would spend the whole budget. Focus and
+	// selection above and below do not need it.
+	if !documentHidden(bel) {
+		_ = boundedClick(page, el, proto.InputMouseButtonLeft, 3)
+	}
+	_ = selectAllNow(bel)
 	if err := bpage.InsertText(text); err != nil {
 		return fmt.Errorf("type text: %w", withinBudget(ctx, budget, err))
 	}
@@ -459,7 +485,7 @@ func TypeFocused(page *rod.Page, text string) error {
 // follow-up Enter would otherwise land on document.body — re-focus first so
 // the keydown reaches the input and submits its form.
 func SubmitOnElement(page *rod.Page, el *rod.Element) error {
-	if err := el.Focus(); err != nil {
+	if err := FocusElement(el); err != nil {
 		return fmt.Errorf("focus before submit: %w", err)
 	}
 	if err := page.Keyboard.Type(input.Enter); err != nil {
@@ -533,9 +559,29 @@ func takeScreenshotImpl(page *rod.Page, fullPage bool, elementRef string, format
 		req.CaptureBeyondViewport = true
 	}
 
-	data, err := req.Call(page)
+	data, err := capture(page, req)
 	if err != nil {
 		return nil, fmt.Errorf("screenshot: %w", err)
+	}
+	return data, nil
+}
+
+// captureTimeout bounds one Page.captureScreenshot. Chromium answers it with
+// a new frame, which a hidden or minimised window may never paint: element
+// captures waited up to 19 minutes for one, holding the session (trace,
+// 2026-10-24).
+const captureTimeout = 15 * time.Second
+
+func capture(page *rod.Page, req *proto.PageCaptureScreenshot) ([]byte, error) {
+	p := page.Timeout(captureTimeout)
+	defer p.CancelTimeout()
+	start := time.Now()
+	data, err := req.Call(p)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("the window painted no frame within %s: it is probably hidden or minimised (a clipped capture needs a painted window; Chromium keeps the request pending, so the next capture may wait too until the window is shown): %w", time.Since(start).Round(time.Second), err)
+		}
+		return nil, err
 	}
 	return data.Data, nil
 }
@@ -565,7 +611,7 @@ func resolveScreenshotFormat(hint string, quality int) proto.PageCaptureScreensh
 // webFrame.setZoomFactor, Chrome's browser zoom), otherwise the capture
 // drifts toward the bottom right under a zoom below 1.
 func elementScreenshotFmt(el *rod.Element, fmt_ proto.PageCaptureScreenshotFormat, quality int) ([]byte, error) {
-	if err := el.ScrollIntoView(); err != nil {
+	if err := ScrollIntoViewNow(el); err != nil {
 		return nil, fmt.Errorf("scroll element into view: %w", err)
 	}
 	box, err := el.Shape()
@@ -590,11 +636,11 @@ func elementScreenshotFmt(el *rod.Element, fmt_ proto.PageCaptureScreenshotForma
 	if quality > 0 && fmt_ != proto.PageCaptureScreenshotFormatPng {
 		req.Quality = intPtr(quality)
 	}
-	data, err := req.Call(page)
+	data, err := capture(page, req)
 	if err != nil {
 		return nil, fmt.Errorf("element screenshot: %w", err)
 	}
-	return data.Data, nil
+	return data, nil
 }
 
 // elementClip converts a viewport-relative CSS box into the document DIP clip
@@ -716,7 +762,7 @@ func intPtr(v int) *int {
 // SelectOption selects option(s) in a <select> element by visible text.
 func SelectOption(page *rod.Page, ref string, values []string, snapshot *PageSnapshot) error {
 	return withSemanticRetry(page, ref, snapshot, func(el *rod.Element) error {
-		if err := el.Select(values, true, rod.SelectorTypeText); err != nil {
+		if err := SelectOptions(el, values); err != nil {
 			return fmt.Errorf("select: %w", err)
 		}
 		settleAfterAction(page, 0)
@@ -743,11 +789,13 @@ func HoverElement(page *rod.Page, el *rod.Element) error {
 		settleAfterAction(page, 0)
 		return nil
 	}
-	if err := el.ScrollIntoView(); err != nil {
-		return fmt.Errorf("scroll: %w", err)
-	}
-	if err := el.Hover(); err != nil {
-		return fmt.Errorf("hover: %w", err)
+	// Like boundedClick: rod's Hover scrolls with a repaint wait no deadline
+	// reaches; here every step is a CDP call on the action budget.
+	budget := actionBudget(page)
+	ctx, cancel := context.WithTimeout(el.GetContext(), budget)
+	defer cancel()
+	if err := hoverWithin(ctx, page, el.Context(ctx)); err != nil {
+		return fmt.Errorf("hover: %w", withinBudget(ctx, budget, err))
 	}
 	settleAfterAction(page, 0)
 	return nil
@@ -770,7 +818,7 @@ var keyMap = map[string]input.Key{
 func PressKey(page *rod.Page, key string, ref string, snapshot *PageSnapshot) error {
 	if ref != "" {
 		err := withSemanticRetry(page, ref, snapshot, func(el *rod.Element) error {
-			if err := el.Focus(); err != nil {
+			if err := FocusElement(el); err != nil {
 				return fmt.Errorf("focus: %w", err)
 			}
 			return nil

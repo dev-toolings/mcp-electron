@@ -95,6 +95,16 @@ func waitDOMContentLoaded(page *rod.Page) error {
 
 // WaitForText polls until visible body text contains needle.
 func WaitForText(page *rod.Page, needle string, timeout time.Duration) error {
+	return waitForText(page, needle, false, timeout)
+}
+
+// WaitForTextGone polls until visible body text no longer contains needle
+// (wait_for text with state hidden: a loading message going away).
+func WaitForTextGone(page *rod.Page, needle string, timeout time.Duration) error {
+	return waitForText(page, needle, true, timeout)
+}
+
+func waitForText(page *rod.Page, needle string, gone bool, timeout time.Duration) error {
 	if page == nil {
 		return fmt.Errorf("page is nil")
 	}
@@ -110,14 +120,31 @@ func WaitForText(page *rod.Page, needle string, timeout time.Duration) error {
 	for {
 		body, err := page.Element("body")
 		if err == nil && body != nil {
-			if pageText, err := body.Text(); err == nil && strings.Contains(pageText, needle) {
+			if pageText, err := body.Text(); err == nil && strings.Contains(pageText, needle) != gone {
 				return nil
 			}
 		}
 		if !time.Now().Before(deadline) {
+			if gone {
+				return fmt.Errorf("wait for text %q to disappear timed out after %s: still shown", needle, timeout)
+			}
 			return fmt.Errorf("wait for text %q timed out after %s", needle, timeout)
 		}
-		time.Sleep(interval)
+		if err := pollSleep(page, interval); err != nil {
+			return err
+		}
+	}
+}
+
+// pollSleep waits d between two polls, or returns at once when the calling
+// tool's context ends (a cancelled call used to poll until its own timeout
+// while holding the session).
+func pollSleep(page *rod.Page, d time.Duration) error {
+	select {
+	case <-page.GetContext().Done():
+		return page.GetContext().Err()
+	case <-time.After(d):
+		return nil
 	}
 }
 
@@ -145,7 +172,9 @@ func WaitForURL(page *rod.Page, needle string, timeout time.Duration) error {
 		if !time.Now().Before(deadline) {
 			return fmt.Errorf("wait for url %q timed out after %s", needle, timeout)
 		}
-		time.Sleep(100 * time.Millisecond)
+		if err := pollSleep(page, 100*time.Millisecond); err != nil {
+			return err
+		}
 	}
 }
 
@@ -183,14 +212,20 @@ func WaitForAgent(page *rod.Page, b *Browser, snapshot *PageSnapshot, spec WaitS
 			return nil, err
 		}
 	}
-	if spec.Text != "" {
-		if err := WaitForText(page, spec.Text, timeout); err != nil {
-			return nil, err
-		}
-	}
 	target := strings.TrimSpace(spec.Ref)
 	if target == "" {
 		target = strings.TrimSpace(spec.Selector)
+	}
+	if spec.Text != "" {
+		// state applies to the text when there is no target: hidden waits
+		// for it to go away (it used to wait for it to appear).
+		wait := WaitForText
+		if target == "" && strings.EqualFold(strings.TrimSpace(spec.State), string(StateHidden)) {
+			wait = WaitForTextGone
+		}
+		if err := wait(page, spec.Text, timeout); err != nil {
+			return nil, err
+		}
 	}
 	if target != "" {
 		state := StateVisible

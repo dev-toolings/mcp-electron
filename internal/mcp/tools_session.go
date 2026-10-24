@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dev-toolings/mcp-electron/internal/electron"
+	"github.com/dev-toolings/mcp-electron/internal/engine"
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -138,13 +139,16 @@ func (s *Server) handleLaunch(ctx context.Context, req mcpgo.CallToolRequest) (*
 }
 
 func (s *Server) handleAttach(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-	sess, err := s.mgr.Attach(ctx, electron.AttachSpec{
+	sess, reused, err := s.mgr.AttachOrReuse(ctx, electron.AttachSpec{
 		Endpoint:  mcpgo.ParseString(req, "endpoint", ""),
 		Inspector: mcpgo.ParseString(req, "inspector_endpoint", ""),
 		Name:      mcpgo.ParseString(req, "name", ""),
 	})
 	if err != nil {
 		return errResult(err)
+	}
+	if reused {
+		return s.sessionResult(ctx, sess, "Already attached to")
 	}
 	return s.sessionResult(ctx, sess, "Attached")
 }
@@ -196,42 +200,64 @@ func (s *Server) handleStatus(ctx context.Context, req mcpgo.CallToolRequest) (*
 	var sb strings.Builder
 	for _, sess := range sessions {
 		st := sess.Status()
-		fmt.Fprintf(&sb, "%s %q %s state=%s since %s", st.ID, st.Name, st.Mode, st.State, st.StateSince.Format("15:04:05"))
-		if st.PID > 0 {
-			fmt.Fprintf(&sb, " pid=%d", st.PID)
-		}
-		fmt.Fprintf(&sb, " cdp=%s", st.Endpoint)
-		if st.Inspector != "" {
-			fmt.Fprintf(&sb, " inspector=%s(%s)", st.Inspector, map[bool]string{true: "connected", false: "not connected"}[st.MainProc])
-		}
-		if st.Generation > 1 {
-			fmt.Fprintf(&sb, " restarts=%d (last %s)", len(st.Restarts), st.Restarts[len(st.Restarts)-1].Format("15:04:05"))
-		}
-		if st.Usage != nil {
-			fmt.Fprintf(&sb, "\n  resources: %d processes, %s resident, %.1f%% cpu", st.Usage.Processes, humanBytes(st.Usage.RSSBytes), st.Usage.CPUPercent)
-			if st.Usage.RSSBytes > memoryWarnBytes {
-				fmt.Fprintf(&sb, " — above %s: stop sessions you no longer need", humanBytes(memoryWarnBytes))
-			}
-		}
-		if st.IdleStopIn > 0 {
-			fmt.Fprintf(&sb, "\n  idle: %s without tool access, stopped automatically in %s", st.IdleFor.Round(time.Second), st.IdleStopIn.Round(time.Second))
-		}
-		if st.LastError != "" {
-			fmt.Fprintf(&sb, "\n  last error: %s", st.LastError)
-		}
-		if st.Note != "" {
-			fmt.Fprintf(&sb, "\n  note: %s", st.Note)
-		}
+		var wins []engine.WindowInfo
+		var winErr error
 		if st.State == electron.StateRunning {
-			if b, err := sess.Browser(ctx); err == nil {
-				if wins, err := b.Windows(); err == nil {
-					sb.WriteString("\n  " + strings.ReplaceAll(windowsText(wins), "\n", "\n  "))
-				}
+			var b *engine.Browser
+			if b, winErr = sess.Browser(ctx); winErr == nil {
+				wins, winErr = b.Windows()
 			}
 		}
+		sb.WriteString(statusText(st, wins, winErr))
 		sb.WriteString("\n")
 	}
 	return text(strings.TrimRight(sb.String(), "\n"))
+}
+
+// statusText renders one session for status. It reads only st and the
+// windows listed by the caller (none while the app is not running), so a
+// session caught mid-restart renders like any other.
+func statusText(st electron.Status, wins []engine.WindowInfo, winErr error) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s %q %s state=%s since %s", st.ID, st.Name, st.Mode, st.State, st.StateSince.Format("15:04:05"))
+	if st.PID > 0 {
+		fmt.Fprintf(&sb, " pid=%d", st.PID)
+	}
+	fmt.Fprintf(&sb, " cdp=%s", st.Endpoint)
+	if st.Inspector != "" {
+		fmt.Fprintf(&sb, " inspector=%s(%s)", st.Inspector, map[bool]string{true: "connected", false: "not connected"}[st.MainProc])
+	}
+	if n := st.Generation - 1; n > 0 {
+		fmt.Fprintf(&sb, " restarts=%d", n)
+		if len(st.Restarts) > 0 {
+			fmt.Fprintf(&sb, " (last %s)", st.Restarts[len(st.Restarts)-1].Format("15:04:05"))
+		}
+	}
+	if st.Usage != nil {
+		fmt.Fprintf(&sb, "\n  resources: %d processes, %s resident, %.1f%% cpu", st.Usage.Processes, humanBytes(st.Usage.RSSBytes), st.Usage.CPUPercent)
+		if st.Usage.RSSBytes > memoryWarnBytes {
+			fmt.Fprintf(&sb, " — above %s: stop sessions you no longer need", humanBytes(memoryWarnBytes))
+		}
+	}
+	if st.IdleStopIn > 0 {
+		fmt.Fprintf(&sb, "\n  idle: %s without tool access, stopped automatically in %s", st.IdleFor.Round(time.Second), st.IdleStopIn.Round(time.Second))
+	}
+	if st.LastError != "" {
+		fmt.Fprintf(&sb, "\n  last error: %s", st.LastError)
+	}
+	if st.Note != "" {
+		fmt.Fprintf(&sb, "\n  note: %s", st.Note)
+	}
+	switch {
+	case st.State != electron.StateRunning:
+	case winErr != nil:
+		fmt.Fprintf(&sb, "\n  windows: %v", winErr)
+	case len(wins) == 0:
+		sb.WriteString("\n  no window open")
+	default:
+		sb.WriteString("\n  " + strings.ReplaceAll(windowsText(wins), "\n", "\n  "))
+	}
+	return sb.String()
 }
 
 func (s *Server) handleWindows(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {

@@ -82,3 +82,39 @@ func TestTraceRecordsCallsCancellationsAndStuckCalls(t *testing.T) {
 		t.Fatalf("cleared trace still has %d lines", len(left))
 	}
 }
+
+// The host cancels a request's context right after the answer: that must
+// not log a cancellation of a call that already ended. And a call that asked
+// for a long wait is not stuck while it is within it.
+func TestTraceIgnoresCancellationAfterTheEndAndHonoursTimeouts(t *testing.T) {
+	tr := NewTracer(filepath.Join(t.TempDir(), "trace.jsonl"))
+	defer tr.Close()
+	tr.stuckAfter = 50 * time.Millisecond
+	for i := 0; i < 50; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		h := tr.Wrap("status", func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+			return mcpgo.NewToolResultText("ok"), nil
+		})
+		_, _ = h(ctx, call(nil))
+		cancel() // as the host does once the answer is sent
+	}
+	wait := tr.Wrap("wait_for", func(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		time.Sleep(150 * time.Millisecond)
+		return mcpgo.NewToolResultText("waited"), nil
+	})
+	_, _ = wait(context.Background(), call(map[string]any{"timeout_ms": 1000}))
+	time.Sleep(20 * time.Millisecond)
+	problems, err := tr.Read(traceQuery{last: 1000, problems: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range problems {
+		t.Errorf("unexpected problem event %v:%v", r["tool"], r["ev"])
+	}
+	if d := stuckAfter(20*time.Second, call(map[string]any{"timeout_ms": 120000})); d != 130*time.Second {
+		t.Fatalf("stuckAfter for a 2 min wait = %s", d)
+	}
+	if d := stuckAfter(20*time.Second, call(nil)); d != 20*time.Second {
+		t.Fatalf("stuckAfter without timeout = %s", d)
+	}
+}

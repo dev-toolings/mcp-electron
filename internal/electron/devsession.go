@@ -1,6 +1,7 @@
 package electron
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -121,12 +122,16 @@ type fileTail struct {
 }
 
 // tailFile follows path from offset; a negative offset starts that many
-// bytes before the current end (the last lines of an adopted app).
+// bytes before the current end (the last lines of an adopted app), at the
+// next line start so no cut line is shown. The start position is fixed
+// before tailFile returns: a line written right after is never skipped (the
+// goroutine used to open the file late and measure the end after the new
+// line, 2026-10-24).
 func tailFile(path string, offset int64, w io.Writer) *fileTail {
 	t := &fileTail{stop: make(chan struct{}), done: make(chan struct{})}
+	f, skipPartial := openTail(path, offset)
 	go func() {
 		defer close(t.done)
-		var f *os.File
 		defer func() {
 			if f != nil {
 				f.Close()
@@ -137,22 +142,21 @@ func tailFile(path string, offset int64, w io.Writer) *fileTail {
 		defer tick.Stop()
 		for {
 			if f == nil {
-				if opened, err := os.Open(path); err == nil {
-					f = opened
-					if offset < 0 {
-						if info, err := f.Stat(); err == nil {
-							offset = max(info.Size()+offset, 0)
-						} else {
-							offset = 0
-						}
-					}
-					_, _ = f.Seek(offset, io.SeekStart)
-				}
+				// Not there yet: it is new, so all of it is fresh output.
+				f, skipPartial = openTail(path, 0)
 			}
 			for f != nil {
 				n, err := f.Read(buf)
-				if n > 0 {
-					_, _ = w.Write(buf[:n])
+				chunk := buf[:n]
+				if skipPartial && n > 0 {
+					if i := bytes.IndexByte(chunk, '\n'); i >= 0 {
+						chunk, skipPartial = chunk[i+1:], false
+					} else {
+						chunk = nil
+					}
+				}
+				if len(chunk) > 0 {
+					_, _ = w.Write(chunk)
 				}
 				if err != nil || n == 0 {
 					break
@@ -166,6 +170,36 @@ func tailFile(path string, offset int64, w io.Writer) *fileTail {
 		}
 	}()
 	return t
+}
+
+// openTail opens path at offset (negative: from the end). skipPartial is
+// true when it starts in the middle of a line.
+func openTail(path string, offset int64) (*os.File, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false
+	}
+	if offset < 0 {
+		end := int64(0)
+		if info, err := f.Stat(); err == nil {
+			end = info.Size()
+		}
+		offset = max(end+offset, 0)
+	}
+	// Inside the file, the line is cut unless the byte before ends one.
+	cut := false
+	if offset > 0 {
+		prev := make([]byte, 1)
+		cut = true
+		if n, _ := f.ReadAt(prev, offset-1); n == 1 && prev[0] == '\n' {
+			cut = false
+		}
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		f.Close()
+		return nil, false
+	}
+	return f, cut
 }
 
 func (t *fileTail) close() {

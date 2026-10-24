@@ -76,6 +76,13 @@ the last error.
 - `stop` terminates the whole process tree of a launched app, including
   detached helpers, top-down (SIGTERM, then SIGKILL after 10 s), and reports
   survivors. Attached apps are left running.
+- `attach` to an endpoint a session already drives returns that session
+  ("Already attached"): never attach again after a restart, the session
+  follows it (tools answer "restarting" meanwhile).
+- A hidden, minimised or covered window keeps running at full rate: every
+  window gets focus emulation over CDP (visible, focused, frames and timers
+  unthrottled) without raising it or taking OS focus; it ends when the
+  session detaches.
 - Only loopback endpoints are accepted.
 - Resources: at most 3 sessions at once (each is a whole Electron process
   tree); `launch`/`attach` refuse beyond that and name what to stop. A

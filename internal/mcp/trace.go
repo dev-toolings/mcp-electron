@@ -231,7 +231,7 @@ func (t *Tracer) Wrap(tool string, h func(context.Context, mcpgo.CallToolRequest
 		t.write(map[string]any{"ev": "start", "id": id, "tool": tool, "args": traceArgs(tool, req.GetArguments())})
 		done := make(chan struct{})
 		go func() {
-			stuck := time.NewTimer(t.stuckAfter)
+			stuck := time.NewTimer(stuckAfter(t.stuckAfter, req))
 			defer stuck.Stop()
 			cancelled := ctx.Done()
 			for {
@@ -239,6 +239,15 @@ func (t *Tracer) Wrap(tool string, h func(context.Context, mcpgo.CallToolRequest
 				case <-done:
 					return
 				case <-cancelled:
+					// The host cancels a request's context once its answer
+					// is sent: both are ready then, and select used to pick
+					// the cancellation, logging « cancelled » after a call
+					// that had already ended (trace, 2026-10-24).
+					select {
+					case <-done:
+						return
+					default:
+					}
 					t.write(map[string]any{"ev": "cancelled", "id": id, "tool": tool, "ms": time.Since(start).Milliseconds(), "reason": fmt.Sprint(ctx.Err())})
 					// Keep watching: a handler that ignores the cancellation still shows up as stuck.
 					cancelled = nil
@@ -269,6 +278,24 @@ func (t *Tracer) Wrap(tool string, h func(context.Context, mcpgo.CallToolRequest
 		return h(ctx, req)
 	}
 }
+
+// stuckAfter is when a call counts as stuck: the trace's threshold, or the
+// wait the call itself asked for (timeout_ms) plus a margin, so a wait_for of
+// 60 s is not dumped as stuck at 20 s.
+func stuckAfter(base time.Duration, req mcpgo.CallToolRequest) time.Duration {
+	asked := time.Duration(mcpgo.ParseInt(req, "timeout_ms", 0)) * time.Millisecond
+	if asked <= 0 {
+		asked = time.Duration(mcpgo.ParseInt(req, "timeout", 0)) * time.Millisecond
+	}
+	if asked <= 0 {
+		return base
+	}
+	return max(base, asked+traceStuckMargin)
+}
+
+// traceStuckMargin is how long past its own timeout a call may run (the
+// snapshot that follows an action, a slow answer) before it counts as stuck.
+const traceStuckMargin = 10 * time.Second
 
 func debugStack() []byte {
 	buf := make([]byte, traceStack)

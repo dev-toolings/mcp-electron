@@ -69,7 +69,7 @@ func (s *Server) pageTools() []toolDef {
 			mcpgo.WithTitleAnnotation("Type text"),
 		), (*Server).handleType},
 		{action("fill_form", "Fill several fields in one call: a JSON object mapping targets to values, e.g. {\"@3\": \"Ada\", \"getByLabel(\\\"Email\\\")\": \"ada@example.com\"}.",
-			mcpgo.WithString("fields", mcpgo.Required(), mcpgo.Description("JSON object: target → text.")),
+			mcpgo.WithString("fields", mcpgo.Required(), mcpgo.Description("JSON object: target → text (or a list of {\"target\", \"value\"}, filled in order).")),
 			mcpgo.WithTitleAnnotation("Fill form"),
 		), (*Server).handleFillForm},
 		{action("select", "Choose option(s) of a <select> by visible label or value.",
@@ -293,29 +293,11 @@ func (s *Server) handleClick(ctx context.Context, req mcpgo.CallToolRequest) (*m
 			}
 			note = n
 			if double {
-				return doubleClick(page, el, button)
+				return engine.DblClickElementWithButton(page, el, button)
 			}
 			return engine.ClickElementWithButton(page, el, button)
 		})
 	})
-}
-
-func doubleClick(page *rod.Page, el *rod.Element, button proto.InputMouseButton) error {
-	if err := el.ScrollIntoView(); err != nil {
-		return err
-	}
-	box, err := el.Shape()
-	if err != nil {
-		return err
-	}
-	r := box.Box()
-	if r == nil {
-		return fmt.Errorf("element has no visible box")
-	}
-	if err := page.Mouse.MoveTo(proto.Point{X: r.X + r.Width/2, Y: r.Y + r.Height/2}); err != nil {
-		return err
-	}
-	return page.Mouse.Click(button, 2)
 }
 
 func (s *Server) handleType(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
@@ -345,7 +327,7 @@ func (s *Server) handleType(ctx context.Context, req mcpgo.CallToolRequest) (*mc
 				}
 			}
 			if el != nil && appendText {
-				if err := el.Focus(); err != nil {
+				if err := engine.FocusElement(el); err != nil {
 					return err
 				}
 				if err := page.InsertText(textArg); err != nil {
@@ -370,17 +352,9 @@ func (s *Server) handleType(ctx context.Context, req mcpgo.CallToolRequest) (*mc
 }
 
 func (s *Server) handleFillForm(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-	raw := mcpgo.ParseString(req, "fields", "")
-	fields := map[string]string{}
-	if raw != "" {
-		if err := json.Unmarshal([]byte(raw), &fields); err != nil {
-			return errorf("fields must be a JSON object of target → text: %v", err)
-		}
-	} else if m, err := stringMap(req, "fields"); err == nil && m != nil {
-		fields = m
-	}
-	if len(fields) == 0 {
-		return errorf("fields is required")
+	fields, err := formFields(req.GetArguments()["fields"])
+	if err != nil {
+		return errResult(err)
 	}
 	mode, err := snapshotMode(req)
 	if err != nil {
@@ -388,25 +362,78 @@ func (s *Server) handleFillForm(ctx context.Context, req mcpgo.CallToolRequest) 
 	}
 	timeout := lookupTimeout(req)
 	return s.withPage(ctx, req, func(sess *electron.Session, b *engine.Browser, page *rod.Page) (*mcpgo.CallToolResult, error) {
-		keys := make([]string, 0, len(fields))
-		for k := range fields {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
 		return mutate(b, page, mode, fmt.Sprintf("filled %d field(s)", len(fields)), func() error {
-			for _, k := range keys {
-				target := normalizeTarget(k)
+			for _, f := range fields {
+				target := normalizeTarget(f.target)
 				el, err := resolve(page, b, target, timeout)
 				if err != nil {
 					return err
 				}
-				if err := engine.TypeElement(page, el, fields[k]); err != nil {
+				if err := engine.TypeElement(page, el, f.text); err != nil {
 					return fmt.Errorf("%s: %w", target, err)
 				}
 			}
 			return nil
 		})
 	})
+}
+
+type formField struct{ target, text string }
+
+// formFields reads fill_form's fields: an object target → text (filled in
+// target order), or a list of {target, value|text} (filled in list order),
+// either as JSON text or as a structured argument. Agents sent the list form
+// and got a JSON error (trace, 2026-10-24).
+func formFields(raw any) ([]formField, error) {
+	const want = `fields must be a JSON object of target → text ({"@3": "Ada"}) or a list of {"target": …, "value": …}`
+	if text, ok := raw.(string); ok {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return nil, fmt.Errorf("fields is required")
+		}
+		if err := json.Unmarshal([]byte(text), &raw); err != nil {
+			return nil, fmt.Errorf("%s: %v", want, err)
+		}
+	}
+	var out []formField
+	switch v := raw.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			text, ok := v[k].(string)
+			if !ok {
+				return nil, fmt.Errorf("%s: the value of %q is not a string", want, k)
+			}
+			out = append(out, formField{k, text})
+		}
+	case []any:
+		for i, item := range v {
+			m, ok := item.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("%s: item %d is not an object", want, i)
+			}
+			target, _ := m["target"].(string)
+			text, ok := m["value"].(string)
+			if !ok {
+				text, ok = m["text"].(string)
+			}
+			if strings.TrimSpace(target) == "" || !ok {
+				return nil, fmt.Errorf("%s: item %d needs a target and a string value", want, i)
+			}
+			out = append(out, formField{target, text})
+		}
+	case nil:
+	default:
+		return nil, fmt.Errorf("%s", want)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("fields is required")
+	}
+	return out, nil
 }
 
 func (s *Server) handleSelect(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
@@ -429,7 +456,7 @@ func (s *Server) handleSelect(ctx context.Context, req mcpgo.CallToolRequest) (*
 			if err != nil {
 				return err
 			}
-			if err := el.Select(values, true, rod.SelectorTypeText); err != nil {
+			if err := engine.SelectOptions(el, values); err != nil {
 				return fmt.Errorf("select: %w", err)
 			}
 			return nil
@@ -459,7 +486,7 @@ func (s *Server) handlePress(ctx context.Context, req mcpgo.CallToolRequest) (*m
 				if err != nil {
 					return err
 				}
-				if err := el.Focus(); err != nil {
+				if err := engine.FocusElement(el); err != nil {
 					return fmt.Errorf("focus: %w", err)
 				}
 			}
@@ -547,7 +574,7 @@ func (s *Server) handleScroll(ctx context.Context, req mcpgo.CallToolRequest) (*
 				if el == nil {
 					return fmt.Errorf("%s: not found", target)
 				}
-				return el.ScrollIntoView()
+				return engine.ScrollIntoViewNow(el)
 			}
 			_, err := engine.ScrollBy(page, dy)
 			return err
@@ -658,7 +685,7 @@ func (s *Server) handleWaitFor(ctx context.Context, req mcpgo.CallToolRequest) (
 			return errResult(err)
 		}
 		label := firstNonEmpty(target, textArg, url, load)
-		if target != "" && state != "visible" {
+		if (target != "" || textArg != "") && state != "visible" {
 			label += " (" + state + ")"
 		}
 		return textf("condition met after %s: %s", time.Since(start).Round(time.Millisecond), label)

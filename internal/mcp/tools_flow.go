@@ -53,7 +53,7 @@ func (s *Server) handleRunFlow(ctx context.Context, req mcpgo.CallToolRequest) (
 		return errorf("give flow (YAML) or file")
 	}
 	timeout := lookupTimeout(req)
-	return s.withPage(ctx, req, func(sess *electron.Session, b *engine.Browser, page *rod.Page) (*mcpgo.CallToolResult, error) {
+	return s.withPageWithin(ctx, req, 0, func(sess *electron.Session, b *engine.Browser, page *rod.Page) (*mcpgo.CallToolResult, error) {
 		outDir := filepath.Join(sess.Dir, "flows", time.Now().Format("150405"))
 		if err := os.MkdirAll(outDir, 0o700); err != nil {
 			return errResult(err)

@@ -110,6 +110,9 @@ func ResolveTarget(page *rod.Page, target string, snapshot *PageSnapshot) (*rod.
 	if strings.HasPrefix(InternalRef(target), "@") {
 		return ResolveRef(page, target, snapshot)
 	}
+	if err := chainedTargetError(target); err != nil {
+		return nil, err
+	}
 	if locator, isLocator, err := parsePlaywrightLocator(target); isLocator {
 		if err != nil {
 			return nil, err
@@ -342,4 +345,34 @@ func normaliseRole(r string) string {
 		return "image"
 	}
 	return strings.ToLower(r)
+}
+
+// chainedTargetError rejects Playwright's « >> » chaining (« .panel >>
+// role=button name=X », « css >> nth=0 », « getByRole(…) >> getByRole(…) »),
+// which is not supported: as a CSS selector it can never match, and every
+// such call used to wait its whole timeout before failing (trace,
+// 2026-10-24). A « >> » inside quotes (an attribute value) is not chaining.
+func chainedTargetError(target string) error {
+	var quote rune
+	prev := rune(0)
+	for i, r := range target {
+		switch {
+		case quote != 0:
+			if r == quote && prev != '\\' {
+				quote = 0
+			}
+		case r == '"' || r == '\'':
+			quote = r
+		case r == '>' && strings.HasPrefix(target[i:], ">>"):
+			return fmt.Errorf("target %q: chaining with >> is not supported; use one CSS selector (.panel button[aria-label=\"Connect\"], :nth-child, :has()), one getByRole/getByText/getByLabel, or a @ref from snapshot", target)
+		}
+		prev = r
+	}
+	return nil
+}
+
+// invalidSelector reports a CSS selector the page rejects as malformed:
+// waiting cannot make it match.
+func invalidSelector(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "is not a valid selector")
 }

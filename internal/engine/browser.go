@@ -180,12 +180,18 @@ func windowTarget(t *proto.TargetTargetInfo) bool {
 	return !strings.HasPrefix(t.URL, "devtools://") && !strings.HasPrefix(t.URL, "chrome-extension://")
 }
 
+// windowsTimeout bounds one listing of the application's targets.
+const windowsTimeout = 10 * time.Second
+
 // Windows lists the application's pages with their stable indexes.
 func (b *Browser) Windows() ([]WindowInfo, error) {
 	if b == nil || b.browser == nil {
 		return nil, fmt.Errorf("browser is not connected")
 	}
-	res, err := proto.TargetGetTargets{}.Call(b.browser)
+	// Bounded: the connection has no deadline of its own, and an app busy
+	// starting up held a launch on this call (trace, 2026-10-24); status,
+	// logs and every page tool list windows.
+	res, err := proto.TargetGetTargets{}.Call(b.browser.Timeout(windowsTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("list targets: %w", err)
 	}

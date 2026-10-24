@@ -70,3 +70,52 @@ func TestParseKeyCombo(t *testing.T) {
 		t.Fatal("non-US character must fail with a hint")
 	}
 }
+
+func TestTimeoutAliasAndRoleBracketShorthand(t *testing.T) {
+	if got := lookupTimeout(call(map[string]any{"timeout": "30000"})); got != 30*time.Second {
+		t.Fatalf("timeout alias: %s", got)
+	}
+	if got := lookupTimeout(call(map[string]any{"timeout": 5000, "timeout_ms": 2000})); got != 2*time.Second {
+		t.Fatalf("timeout_ms must win: %s", got)
+	}
+	for in, want := range map[string]string{
+		`role=textbox[name="Message à l’agent"]`: `getByRole("textbox", { name: "Message à l’agent" })`,
+		`role=button[name='Save']`:              `getByRole("button", { name: "Save" })`,
+		`role=button[name=/^Mode/i]`:            `getByRole("button", { name: /^Mode/i })`,
+	} {
+		if got := normalizeTarget(in); got != want {
+			t.Errorf("%q → %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFormFieldsAcceptsObjectsAndLists(t *testing.T) {
+	cases := []struct {
+		raw  any
+		want []formField
+	}{
+		{`{"@4":"kev","@3":"host"}`, []formField{{"@3", "host"}, {"@4", "kev"}}},
+		{`[{"target":"@4","value":"kev"},{"target":"@3","text":"host"}]`, []formField{{"@4", "kev"}, {"@3", "host"}}},
+		{map[string]any{"@1": "a"}, []formField{{"@1", "a"}}},
+		{[]any{map[string]any{"target": "@2", "value": "b"}}, []formField{{"@2", "b"}}},
+	}
+	for _, c := range cases {
+		got, err := formFields(c.raw)
+		if err != nil {
+			t.Fatalf("%v: %v", c.raw, err)
+		}
+		if len(got) != len(c.want) {
+			t.Fatalf("%v: %v", c.raw, got)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Fatalf("%v: %v, want %v", c.raw, got, c.want)
+			}
+		}
+	}
+	for _, bad := range []any{"", `[{"target":"@1"}]`, `{"@1": 3}`, `[1]`, 42, nil} {
+		if _, err := formFields(bad); err == nil {
+			t.Errorf("%v accepted", bad)
+		}
+	}
+}

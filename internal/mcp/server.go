@@ -60,7 +60,7 @@ const Instructions = `mcp-electron drives one Electron application for developme
 Loop: launch (project dir, .app, or a dev command) or attach → snapshot (refs @N) → click/type/press/… by ref, CSS selector or getByRole/getByText/getByLabel → wait_for → logs on errors → screenshot when layout matters → stop.
 Actions return a diff of the interactive elements; re-snapshot after a navigation or a big UI change (refs are per window).
 eval runs JavaScript in a window (renderer); eval_main runs in the main process (app, BrowserWindow, ipcMain, dialog… are in scope).
-A dev command (bun run dev) that restarts Electron on recompilation is followed automatically: tools answer "restarting" until the new instance is reachable.
+A dev command (bun run dev) that restarts Electron on recompilation is followed automatically, by a launched or an attached session: tools answer "restarting" until the new instance is reachable; never attach again (attach to an endpoint already driven returns its session).
 When a call fails, hangs, times out or is interrupted, read trace (problems: true; with_stacks: true for a call reported stuck): every call's arguments, duration and outcome, host cancellations, and the server's goroutines when a call ran past 20 s. Use it to find the cause and fix mcp-electron itself.`
 
 // toolDef is one entry of the tool table.

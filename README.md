@@ -146,6 +146,13 @@ matching the target is visible.
   re-attaches on its own; `status` shows the restart count.
 - **Attach**: `attach` with `http://127.0.0.1:PORT` of an app already
   started with `--remote-debugging-port`. Attached apps are never killed.
+  Attaching to an endpoint a session already drives returns that session,
+  which follows the app's restarts on the same port by itself.
+- **Hidden windows**: every window gets CDP focus emulation (plus
+  `Page.setWebLifecycleState active`), so a minimised, hidden or covered
+  window reads as visible and focused and keeps its animation frames and
+  timers at full rate; the window is never raised and OS focus is never
+  taken. The emulation belongs to the connection and ends with it.
 
 Apps that relocate their own data directory need their variable in `env`
 (Escape: `ESCAPE_TEST_DATA`).

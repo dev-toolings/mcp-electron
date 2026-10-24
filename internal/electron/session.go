@@ -3,6 +3,7 @@ package electron
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -247,7 +248,10 @@ func (s *Session) Page(ctx context.Context, window int) (*engine.Browser, *rod.P
 }
 
 // preparePage starts the event hub (console, exceptions, network) and the
-// dialog handler on a page the first time it is used.
+// dialog handler on a page the first time it is used, and keeps the page
+// running at full rate while its window is hidden (engine.KeepActive). The
+// set of prepared pages is reset with every new connection, so a page of an
+// app the dev loop restarted is prepared again.
 func (s *Session) preparePage(b *engine.Browser, page *rod.Page) {
 	key := string(page.TargetID)
 	s.mu.Lock()
@@ -262,7 +266,13 @@ func (s *Session) preparePage(b *engine.Browser, page *rod.Page) {
 	}
 	_, _ = engine.StartEventHub(page)
 	engine.StartDialogAutoHandler(page, s.dialogs)
+	if err := engine.KeepActive(page, keepActiveTimeout); err != nil && s.ring != nil {
+		s.ring.Add("mcp-electron", fmt.Sprintf("window %s may be throttled while hidden: %v", key, err))
+	}
 }
+
+// keepActiveTimeout bounds the CDP calls that keep a page active.
+const keepActiveTimeout = 3 * time.Second
 
 func (s *Session) ensureHubsLocked() {
 	if s.browser == nil {
@@ -312,11 +322,8 @@ func (s *Session) tickLocked(ctx context.Context) {
 			return
 		}
 		s.browser = b
-		s.generation++
+		s.recordReconnectLocked()
 		s.lastErr = ""
-		if s.state == StateRestarting {
-			s.restarts = append(s.restarts, time.Now())
-		}
 		s.setStateLocked(StateRunning)
 	}
 	if s.main == nil && s.Inspector != "" {
@@ -326,6 +333,26 @@ func (s *Session) tickLocked(ctx context.Context) {
 	}
 	s.ensureHubsLocked()
 }
+
+// recordReconnectLocked counts a new connection. Every connection after the
+// first follows a lost one: a restart the probe saw (state restarting), or
+// one fast enough to happen between two probes, noticed by Browser as a dead
+// connection to an endpoint that answers again. Both count, so the restart
+// list and the generation agree (status read the last restart of an empty
+// list and panicked, 2026-10-24).
+func (s *Session) recordReconnectLocked() {
+	if s.generation > 0 {
+		s.restarts = append(s.restarts, time.Now())
+		if len(s.restarts) > maxRestartsKept {
+			s.restarts = append(s.restarts[:0:0], s.restarts[len(s.restarts)-maxRestartsKept:]...)
+		}
+	}
+	s.generation++
+}
+
+// maxRestartsKept bounds the restart times a session remembers; Generation
+// still counts every connection.
+const maxRestartsKept = 50
 
 func (s *Session) setStateLocked(st State) {
 	if s.state != st {
@@ -550,7 +577,24 @@ func (m *Manager) List() []*Session {
 }
 
 func (m *Manager) add(s *Session) (*Session, error) {
+	added, _, err := m.register(s, false)
+	return added, err
+}
+
+// addUnique registers s, unless an open session already drives the same
+// endpoint: that one is returned with reused true and s is left unregistered.
+func (m *Manager) addUnique(s *Session) (*Session, bool, error) {
+	return m.register(s, true)
+}
+
+func (m *Manager) register(s *Session, unique bool) (*Session, bool, error) {
 	m.mu.Lock()
+	if unique {
+		if prev := m.sessionAtLocked(normalizeEndpoint(s.Endpoint)); prev != nil {
+			m.mu.Unlock()
+			return prev, true, nil
+		}
+	}
 	m.seq++
 	s.ID = "s" + strconv.Itoa(m.seq)
 	m.sessions[s.ID] = s
@@ -575,10 +619,10 @@ func (m *Manager) add(s *Session) (*Session, error) {
 		s.dialogs = &engine.DialogAutoPolicy{Accept: true}
 	}
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	go s.watch()
-	return s, nil
+	return s, false, nil
 }
 
 const (
@@ -757,6 +801,15 @@ func (m *Manager) launchCommand(ctx context.Context, spec LaunchSpec) (*Session,
 // adoptCommand takes over a dev command an earlier server started and left
 // running, instead of starting a second copy.
 func (m *Manager) adoptCommand(ctx context.Context, prev *devState, statePath string, timeout time.Duration) (*Session, error) {
+	// Launched a second time by this same server: the session it has is the
+	// one to keep using, not a second session on the same app.
+	m.mu.Lock()
+	open := m.sessionAtLocked(loopbackEndpoint(prev.CDPPort))
+	m.mu.Unlock()
+	if open != nil {
+		open.Touch()
+		return open, nil
+	}
 	s := &Session{Info: Info{Name: prev.Name, Mode: "command", Owned: true, Endpoint: loopbackEndpoint(prev.CDPPort), PID: prev.PID}, ring: NewRing(5000), dev: prev, devPath: statePath}
 	if prev.InspPort > 0 {
 		s.Inspector = loopbackEndpoint(prev.InspPort)
@@ -860,22 +913,114 @@ func (s *Session) waitFirstPaint(b *engine.Browser, d time.Duration) {
 	}
 }
 
-// Attach connects to a running application without owning it.
+// Attach connects to a running application without owning it, or returns
+// the session already driving that endpoint.
 func (m *Manager) Attach(ctx context.Context, spec AttachSpec) (*Session, error) {
-	if spec.Endpoint == "" {
-		return nil, &UsageError{"give endpoint (http://127.0.0.1:PORT of an Electron app started with --remote-debugging-port)"}
-	}
-	if err := m.admit(); err != nil {
-		return nil, err
-	}
-	endpoint := strings.TrimRight(spec.Endpoint, "/")
+	s, _, err := m.AttachOrReuse(ctx, spec)
+	return s, err
+}
+
+// normalizeEndpoint turns "9333", "localhost:9333/" or
+// "http://LOCALHOST:9333" into http://127.0.0.1:9333, so one application
+// reached under several spellings is recognised as the same.
+func normalizeEndpoint(raw string) string {
+	endpoint := strings.TrimRight(strings.TrimSpace(raw), "/")
 	if !strings.Contains(endpoint, "://") {
 		if p, err := strconv.Atoi(endpoint); err == nil {
-			endpoint = loopbackEndpoint(p)
-		} else {
-			endpoint = "http://" + endpoint
+			return loopbackEndpoint(p)
+		}
+		endpoint = "http://" + endpoint
+	}
+	scheme, rest, _ := strings.Cut(endpoint, "://")
+	host, path, _ := strings.Cut(rest, "/")
+	if h, port, err := net.SplitHostPort(host); err == nil && strings.EqualFold(h, "localhost") {
+		host = net.JoinHostPort("127.0.0.1", port)
+	}
+	endpoint = strings.ToLower(scheme) + "://" + strings.ToLower(host)
+	if path != "" {
+		endpoint += "/" + path
+	}
+	return endpoint
+}
+
+// sessionAtLocked returns the open session driving endpoint (normalised),
+// whatever its mode: attaching to the port of an app launched here reuses it
+// too.
+func (m *Manager) sessionAtLocked(endpoint string) *Session {
+	for _, s := range m.sessions {
+		if normalizeEndpoint(s.Endpoint) == endpoint {
+			return s
 		}
 	}
+	return nil
+}
+
+// AttachOrReuse is Attach that also says whether an open session was
+// reused. A second attach to the same endpoint used to open a second session
+// on the same app, after which every tool without session failed with
+// « several sessions are open » (2026-10-24). The reused session follows the
+// app's restarts on its own (see tickLocked), so attaching again is never
+// needed.
+func (m *Manager) AttachOrReuse(ctx context.Context, spec AttachSpec) (*Session, bool, error) {
+	if strings.TrimSpace(spec.Endpoint) == "" {
+		return nil, false, &UsageError{"give endpoint (http://127.0.0.1:PORT of an Electron app started with --remote-debugging-port)"}
+	}
+	endpoint := normalizeEndpoint(spec.Endpoint)
+	m.mu.Lock()
+	prev := m.sessionAtLocked(endpoint)
+	m.mu.Unlock()
+	if prev != nil {
+		prev.Touch()
+		prev.addInspector(ctx, spec.Inspector)
+		return prev, true, nil
+	}
+	if err := m.admit(); err != nil {
+		return nil, false, err
+	}
+	s, err := m.attachNew(ctx, endpoint, spec)
+	if err != nil {
+		return nil, false, err
+	}
+	// Two attach calls may race to the same endpoint: the loser keeps the
+	// winner's session and lets its own connection go.
+	added, reused, err := m.addUnique(s)
+	if reused {
+		s.closeUnregistered()
+		added.Touch()
+		added.addInspector(ctx, spec.Inspector)
+	}
+	return added, reused, err
+}
+
+// addInspector connects the main process inspector of a reused session that
+// had none.
+func (s *Session) addInspector(ctx context.Context, raw string) {
+	if strings.TrimSpace(raw) == "" {
+		return
+	}
+	insp := normalizeEndpoint(raw)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped || s.main != nil || (s.Inspector != "" && s.Inspector != insp) {
+		return
+	}
+	s.Inspector = insp
+	if mc, err := ConnectMain(ctx, insp); err == nil {
+		s.main = mc
+	} else {
+		s.Note = err.Error()
+	}
+}
+
+// closeUnregistered drops the connections of a session that was never added.
+func (s *Session) closeUnregistered() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopped = true
+	s.detachLocked()
+}
+
+func (m *Manager) attachNew(ctx context.Context, endpoint string, spec AttachSpec) (*Session, error) {
 	v, ok := probeCDP(ctx, endpoint)
 	if !ok {
 		if v.Browser != "" {
@@ -887,16 +1032,11 @@ func (m *Manager) Attach(ctx context.Context, spec AttachSpec) (*Session, error)
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{Info: Info{Name: firstNonEmpty(spec.Name, v.Browser), Mode: "attach", Endpoint: endpoint}, browser: b, generation: 1}
+	// The ring holds this server's own notes about the app (a window that
+	// could not be kept active, …): an attached app's output is not ours.
+	s := &Session{Info: Info{Name: firstNonEmpty(spec.Name, v.Browser), Mode: "attach", Endpoint: endpoint}, browser: b, generation: 1, ring: NewRing(200)}
 	if spec.Inspector != "" {
-		insp := strings.TrimRight(spec.Inspector, "/")
-		if !strings.Contains(insp, "://") {
-			if p, err := strconv.Atoi(insp); err == nil {
-				insp = loopbackEndpoint(p)
-			} else {
-				insp = "http://" + insp
-			}
-		}
+		insp := normalizeEndpoint(spec.Inspector)
 		s.Inspector = insp
 		if mc, err := ConnectMain(ctx, insp); err == nil {
 			s.main = mc
@@ -904,7 +1044,7 @@ func (m *Manager) Attach(ctx context.Context, spec AttachSpec) (*Session, error)
 			s.Note = err.Error()
 		}
 	}
-	return m.add(s)
+	return s, nil
 }
 
 // StaleArtifactsAge is the age past which a session artifacts directory left

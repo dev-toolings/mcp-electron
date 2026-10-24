@@ -117,6 +117,9 @@ func WaitForTarget(page *rod.Page, target string, snapshot *PageSnapshot, state 
 	if strings.HasPrefix(InternalRef(strings.TrimSpace(target)), "@") {
 		return WaitForRef(page, target, snapshot, state, timeout)
 	}
+	if err := chainedTargetError(target); err != nil {
+		return nil, err
+	}
 	if locator, isLocator, err := parsePlaywrightLocator(target); isLocator {
 		if err != nil {
 			return nil, err
@@ -151,6 +154,8 @@ func WaitForTarget(page *rod.Page, target string, snapshot *PageSnapshot, state 
 			}
 		} else if state == StateHidden {
 			return nil, nil
+		} else if invalidSelector(err) {
+			return nil, err
 		}
 
 		select {
