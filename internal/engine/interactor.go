@@ -410,16 +410,30 @@ func TypeElement(page *rod.Page, el *rod.Element, text string) error {
 		_ = el.Blur()
 		return nil
 	}
-	if err := el.Focus(); err != nil {
-		return fmt.Errorf("focus: %w", err)
+	// Every CDP call on the action budget, like boundedClick: an unbounded Focus on a page whose app had just restarted
+	// waited 30 min and held the session lock, blocking every later tool (trace, 2026-10-24).
+	budget := actionBudget(page)
+	ctx, cancel := context.WithTimeout(el.GetContext(), budget)
+	defer cancel()
+	bel, bpage := el.Context(ctx), page.Context(ctx)
+	if err := bel.Focus(); err != nil {
+		return fmt.Errorf("focus: %w", withinBudget(ctx, budget, err))
 	}
 	_ = boundedClick(page, el, proto.InputMouseButtonLeft, 3)
-	_ = el.SelectAllText()
-	if err := page.InsertText(text); err != nil {
-		return fmt.Errorf("type text: %w", err)
+	_ = bel.SelectAllText()
+	if err := bpage.InsertText(text); err != nil {
+		return fmt.Errorf("type text: %w", withinBudget(ctx, budget, err))
 	}
-	_ = el.Blur()
+	_ = bel.Blur()
 	return nil
+}
+
+// withinBudget names the budget when ctx ran out, so a stalled page reads as such rather than as a bare deadline error.
+func withinBudget(ctx context.Context, budget time.Duration, err error) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("no answer from the page within %s (it may have restarted: check status): %w", budget, err)
+	}
+	return err
 }
 
 // TypeFocused writes text into the currently focused element without changing
@@ -431,8 +445,11 @@ func TypeFocused(page *rod.Page, text string) error {
 		}
 		return nil
 	}
-	if err := page.InsertText(text); err != nil {
-		return fmt.Errorf("type focused text: %w", err)
+	budget := actionBudget(page)
+	ctx, cancel := context.WithTimeout(page.GetContext(), budget)
+	defer cancel()
+	if err := page.Context(ctx).InsertText(text); err != nil {
+		return fmt.Errorf("type focused text: %w", withinBudget(ctx, budget, err))
 	}
 	return nil
 }
